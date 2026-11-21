@@ -170,7 +170,9 @@ void fmt_hms(char* out, size_t len, uint32_t sec) {
 
 // 接続の状態（メイン画面のヘッダー下段）
 const char* link_label() {
-    switch (g_state.bt_state.load()) {
+    BtState st = g_state.bt_state.load();
+    if (bt_ag::reconnecting() && st <= BtState::Connecting) return "つなぎ直し中…";
+    switch (st) {
         case BtState::Off: return "Bluetooth 停止";
         case BtState::Idle: return "未接続";
         case BtState::Discovering: return "検索中";
@@ -292,6 +294,9 @@ constexpr LevelPoint kAxp192Levels[] = {
     {4100, 100}, {4011, 90}, {3924, 80}, {3864, 70}, {3805, 60}, {3754, 50}, {3718, 40}, {3697, 30},
     {3673, 20},  {3621, 10}, {3600, 5},  {3583, 3},  {3566, 2},  {3545, 1},  {3500, 0},
 };
+// USB を抜いた直後は、充電で上がっていた電圧が数秒で下がる（4.09V → 3.95V を 3 秒）。
+// その高い電圧からならし始めないよう、電池で動き始めてから kFollowMs の間は、ならさずに電圧に従う
+constexpr uint32_t kFollowMs = 10 * 1000;
 constexpr uint32_t kSmoothMs = 60 * 1000;   // 電圧をならす時定数
 constexpr uint32_t kSettleMs = 120 * 1000;  // 電池で動き始めてから、表示を増やさないようにするまで（ならしが落ち着くまで）
 
@@ -325,6 +330,9 @@ int axp192_gauge(bool on_battery, int mv, uint32_t now) {
     BatteryGauge& g = s_gauge;
     if (!g.started || on_battery != g.on_battery) {
         g = BatteryGauge{true, on_battery, static_cast<float>(mv), now, now, 0};
+    } else if (now - g.since_ms < kFollowMs) {
+        g.mv = mv;
+        g.last_ms = now;
     } else {
         g.mv += (mv - g.mv) * std::min(1.0f, static_cast<float>(now - g.last_ms) / kSmoothMs);
         g.last_ms = now;
@@ -351,7 +359,7 @@ bool usb_power() {
 
 // 電池の試験（電池が切れるまでの時間を測る）のときだけ true にする。電池で動いている間、
 // 残量の % が変わったときと、変わらなくても kBatteryLogIntervalMs ごとに、前の行からの平均の電圧と放電電流をログに書く。
-constexpr bool kBatteryTestLog = true;
+constexpr bool kBatteryTestLog = false;
 constexpr uint32_t kBatteryLogIntervalMs = 5 * 60 * 1000;
 
 struct BatteryTestLog {
@@ -492,7 +500,8 @@ void draw_main() {
     BtState st = g_state.bt_state.load();
     char peer[40];
     state_get_peer_name(peer, sizeof(peer));
-    if (st == BtState::Idle) a = peer[0] ? "BT接続" : "機器検索";
+    if (bt_ag::reconnecting()) a = "BT切断";  // つなぎ直しの間は、押すとやめる
+    else if (st == BtState::Idle) a = peer[0] ? "BT接続" : "機器検索";
     else if (st == BtState::Discovering) a = "検索中";
     else a = "BT切断";
     buttons(a, "メニュー", want ? "停止" : "録音");
@@ -595,7 +604,7 @@ void draw_menu() {
                 toggle_switch(yc, g_state.loopback.load(), audio_on, false);
                 break;
             case kRowSync:
-                text(kFont16, kText, 16, yc, "同期信号", textdatum_t::middle_left);
+                text(kFont16, kText, 16, yc, "映像同期", textdatum_t::middle_left);
                 text(kFont12, kDim, kRowNoteX, yc, "映像と音を合わせる", textdatum_t::middle_left);
                 break;
             case kRowMicGain: {
@@ -850,30 +859,35 @@ void draw_devices() {
     buttons(st == BtState::Discovering ? "" : "検索", "", "戻る", st == BtState::Idle ? 0 : 1);
 }
 
-// ---- 同期信号 --------------------------------------------------------------
+// ---- 映像同期 --------------------------------------------------------------
 // 映像と録音を合わせるための画面。15 秒ごと（毎分 0・15・30・45 秒）に、時報と同じ並びで鳴らす。
-// 12・13・14 秒に予報音を鳴らし、鳴っている間は真ん中の四角を白く光らせる。
-// 15 秒ちょうどに正報音を鳴らし、鳴っている間は画面全体の白黒を反転する（液晶の反転の命令なので一瞬で切り替わる）。
-// スピーカーの音をインカムのマイクに拾わせ、画面をカメラに写す。正報音の鳴り始めと反転の始まりで、映像と音を合わせる。
-// 鳴らす時刻と光らせる時刻は sync_task が決め、画面の時刻の数字・四角・反転は SPI のロックを持って直接描き換える。
+// 12・13・14 秒に予報音（ぴ）を鳴らし、鳴っている間は真ん中の四角を反対の色にする。
+// 15 秒ちょうどに正報音（ぷ）を鳴らし、鳴り始めと同時に四角の白と黒を入れ替える（次の正報音まで保つ）。
+// スピーカーの音をインカムのマイクに拾わせ、画面をカメラに写す。正報音の鳴り始めと四角が入れ替わるコマで、映像と音を合わせる。
+// 鳴らす時刻と描き換える時刻は sync_task が決め、画面の時刻の数字と四角は SPI のロックを持って直接描き換える。
 
 constexpr int kSyncPeriodSec = 15;
 constexpr int kSyncFirstPipSec = 12;  // 15 秒周期の中で、予報音を鳴らし始める秒
 constexpr int kSyncClockY = 47;       // 時刻の数字（Font7、高さ 48）
 constexpr int kSyncClockH = 48;
-constexpr int kSyncFlashX = 40;  // 光る四角
+constexpr int kSyncFlashX = 40;  // 白黒が入れ替わる四角
 constexpr int kSyncFlashY = 103;
 constexpr int kSyncFlashW = kW - 80;
 constexpr int kSyncFlashH = 88;
 constexpr uint8_t kSyncBrightness = 255;  // カメラに写りやすいよう、この画面の間は一番明るくする
-// 鳴らす指示から光らせるまでの時間（ms）。スピーカーが鳴り出すまでの遅れに合わせる。負なら光らせてから鳴らす。
-// 実測で決める（画面と音を一緒に撮ったスローモーション動画で、ずれを測る）
+// 鳴らす指示から四角を描き換えるまでの時間（ms）。スピーカーが鳴り出すまでの遅れに合わせる。負なら描き換えてから鳴らす。
+// 画面と音を一緒に撮ったスローモーション動画で、0 で四角の入れ替わりと音の鳴り始めが合っていた
 constexpr int kSyncFlashDelayMs = 0;
 // 鳴らす時刻の少し前に SPI のロックを取っておき、SD の書き込みや画面全体の描き直しで遅れないようにする
 constexpr int kSyncLockLeadMs = 50;
 
-std::atomic<bool> s_sync_active{false};  // 同期信号の画面が出ていて、画面が点いている
-std::atomic<bool> s_sync_flash{false};   // 四角が光っている（画面全体を描き直すときに使う）
+std::atomic<bool> s_sync_active{false};  // 映像同期の画面が出ていて、画面が点いている
+// 四角の色（画面全体を描き直すときにも使う）。地の色は「ぷ」のたびに白と黒を入れ替え、次の「ぷ」まで保つ。
+// 動画を編集する人は、コマ送りでこの入れ替わり（エッジ）を見つけ、音の立ち上がりに重ねる。
+// 「ぴ」が鳴っている間は、地の色の反対にする
+std::atomic<bool> s_sync_white{false};  // 地の色が白
+std::atomic<bool> s_sync_pip{false};    // 「ぴ」で反対の色にしている
+uint16_t sync_box_color() { return s_sync_white.load() != s_sync_pip.load() ? kText : kBg; }
 M5Canvas s_syncv(&M5.Display);           // 時刻の数字（2 色。内部 RAM）
 
 int64_t wall_us() {
@@ -883,7 +897,7 @@ int64_t wall_us() {
 }
 
 void draw_sync() {
-    status_bar("同期信号");
+    status_bar("映像同期");
     struct tm t;
     rtc_clock::local_now(&t);
     char b[24];
@@ -892,16 +906,15 @@ void draw_sync() {
     strftime(b, sizeof(b), "%H:%M:%S", &t);
     text(&fonts::Font7, kText, kW / 2, kSyncClockY, b, textdatum_t::top_center);
     s_cv.drawRect(kSyncFlashX, kSyncFlashY, kSyncFlashW, kSyncFlashH, kDim);
-    if (s_sync_flash.load()) s_cv.fillRect(kSyncFlashX + 2, kSyncFlashY + 2, kSyncFlashW - 4, kSyncFlashH - 4, kText);
+    s_cv.fillRect(kSyncFlashX + 2, kSyncFlashY + 2, kSyncFlashW - 4, kSyncFlashH - 4, sync_box_color());
     text(kFont12, kDim, kW / 2, kSyncFlashY + kSyncFlashH + 5, "マイクの近くに置き、カメラに写してください",
          textdatum_t::top_center);
     buttons("", "", "戻る");
 }
 
 // 以下の 2 つは SPI のロックを持って呼ぶ
-void sync_draw_flash(bool on) {
-    s_sync_flash.store(on);
-    M5.Display.fillRect(kSyncFlashX + 2, kSyncFlashY + 2, kSyncFlashW - 4, kSyncFlashH - 4, on ? kText : kBg);
+void sync_draw_box() {
+    M5.Display.fillRect(kSyncFlashX + 2, kSyncFlashY + 2, kSyncFlashW - 4, kSyncFlashH - 4, sync_box_color());
 }
 
 void sync_draw_clock() {
@@ -920,7 +933,7 @@ void sync_task(void*) {
             vTaskDelay(pdMS_TO_TICKS(20));
             continue;
         }
-        // 次の秒の変わり目に、時刻の数字を描き換え、鳴らす秒なら鳴らして光らせる
+        // 次の秒の変わり目に、時刻の数字を描き換え、鳴らす秒なら鳴らして四角を描き換える
         int64_t next_us = (wall_us() / 1000000 + 1) * 1000000;
         int phase = static_cast<int>((next_us / 1000000) % kSyncPeriodSec);
         bool mark = phase == 0;
@@ -936,8 +949,9 @@ void sync_task(void*) {
             if (!s_sync_active.load()) continue;
             if (mark || pip) {
                 auto show = [&] {
-                    if (mark) M5.Display.invertDisplay(true);
-                    else sync_draw_flash(true);
+                    if (mark) s_sync_white.store(!s_sync_white.load());
+                    else s_sync_pip.store(true);
+                    sync_draw_box();
                 };
                 auto beep = [&] {
                     sound::play(mark ? sound::Cue::SyncMark : sound::Cue::SyncPip);
@@ -955,17 +969,17 @@ void sync_task(void*) {
             }
             sync_draw_clock();
         }
-        if (mark || pip) {
-            vTaskDelay(pdMS_TO_TICKS(mark ? sound::kSyncMarkMs : sound::kSyncPipMs));
+        if (pip) {
+            // 予報音が鳴り終わったら、四角を地の色に戻す（正報音で入れ替えた色は、次の正報音まで保つ）
+            vTaskDelay(pdMS_TO_TICKS(sound::kSyncPipMs));
             SpiLockGuard lock;
-            if (mark) M5.Display.invertDisplay(false);
-            else if (s_sync_active.load()) sync_draw_flash(false);
-            else s_sync_flash.store(false);
+            s_sync_pip.store(false);
+            if (s_sync_active.load()) sync_draw_box();
         }
     }
 }
 
-// 同期信号の画面に入った・出た（消灯・点灯を含む）
+// 映像同期の画面に入った・出た（消灯・点灯を含む）
 void sync_start() {
     sound::set_loud(true);
     M5.Display.setBrightness(kSyncBrightness);
@@ -973,12 +987,11 @@ void sync_start() {
 }
 
 void sync_stop() {
-    s_sync_active.store(false);
     {
-        SpiLockGuard lock;
-        M5.Display.invertDisplay(false);
+        SpiLockGuard lock;  // 描き換えの途中で止めない
+        s_sync_active.store(false);
+        s_sync_pip.store(false);
     }
-    s_sync_flash.store(false);
     sound::set_loud(false);
 }
 
@@ -995,7 +1008,7 @@ void render_full() {
         draw_toast();
     };
     if (s_screen == Screen::Sync) {
-        // 同期信号の画面は sync_task がロックを持って描き換えるので、組み立てから送るまでをロックの中で行い、
+        // 映像同期の画面は sync_task がロックを持って描き換えるので、組み立てから送るまでをロックの中で行い、
         // 光っている四角を古い絵で消さないようにする
         SpiLockGuard lock;
         compose();
@@ -1035,11 +1048,11 @@ void go(Screen s) {
     if (s != Screen::Sync && s_screen == Screen::Sync) {
         sync_stop();
         M5.Display.setBrightness(kBrightness[s_brightness]);
-        event_log("同期信号を終了");
+        event_log("映像同期を終了");
     }
     s_screen = s;
     if (enter_sync) {
-        event_log("同期信号を開始");
+        event_log("映像同期を開始");
         sync_start();
     }
     static const char* kNames[] = {"main", "menu", "devices", "log", "sync"};
@@ -1066,7 +1079,9 @@ void toggle_rec() {
 void on_main(int btn, int, int) {
     if (btn == 0) {
         BtState st = g_state.bt_state.load();
-        if (st == BtState::Idle) {
+        if (bt_ag::reconnecting()) {
+            bt_ag::disconnect();  // つなぎ直しをやめる
+        } else if (st == BtState::Idle) {
             if (!bt_ag::connect_saved()) go(Screen::Devices);
         } else if (st >= BtState::Connecting) {
             bt_ag::disconnect();
@@ -1279,7 +1294,7 @@ constexpr uint32_t kShutdownToastMs = 1000;
 
 // factory_reset: 電源を切る代わりに、NVS をすべて消して再起動する（メニューの「設定の初期化」）
 void graceful_shutdown(const char* message, bool factory_reset) {
-    if (s_screen == Screen::Sync) go(Screen::Main);  // 同期信号を止めてから（シャットダウンの音と重ねない）
+    if (s_screen == Screen::Sync) go(Screen::Main);  // 映像同期を止めてから（シャットダウンの音と重ねない）
     if (!s_screen_on) set_screen(true);
     // 録音中なら、まずふだんの「停止」と同じ流れで止める（ボタンが「録音」に戻り、ドソが鳴る）
     if (g_state.rec_requested.load()) {
@@ -1467,7 +1482,7 @@ void start() {
     s_syncv.setPaletteColor(1, 0xFFFFFFu);
     s_meter_ms = millis32();
     xTaskCreatePinnedToCore(ui_task, "ui", 8192, nullptr, 2, nullptr, 1);
-    // 同期信号の時刻を守るため、録音処理（10）より上、音のタスクと同じ優先度にする
+    // 映像同期の時刻を守るため、録音処理（10）より上、音のタスクと同じ優先度にする
     xTaskCreatePinnedToCore(sync_task, "sync", 4096, nullptr, 11, nullptr, 1);
 }
 

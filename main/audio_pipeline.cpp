@@ -132,6 +132,7 @@ void finish_file() {
     s_file_open = false;
     g_state.recording.store(false);
     event_log("録音終了 %lu 秒", (unsigned long)(s_file_frames / 50));
+    storage::flush_log();  // 「録音終了」まで SD に確定する（止めてすぐ SD を抜かれても残るように）
 }
 
 // UI が読むまでの最大値を残す（UI は exchange で読み、リセットする）

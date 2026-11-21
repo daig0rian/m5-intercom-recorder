@@ -104,7 +104,9 @@ void OggOpusWriter::begin(uint32_t serial, uint32_t input_sample_rate, uint16_t 
 void OggOpusWriter::add_packet(const uint8_t* packet, size_t len, uint32_t samples_48k) {
     uint8_t segs[kMaxSegments];
     int n = lace(len, segs);
-    if (nsegs_ + n > kMaxSegments || body_len_ + len > kMaxBody) flush(false);
+    // いっぱいのページは、次のパケットが来たときに書き出す。最後のページにパケットが残り、
+    // 終わりの印がパケットの入ったページに付く（空のページの granule は -1 にする決まりがあるため）
+    if (packets_ >= kPacketsPerPage || nsegs_ + n > kMaxSegments || body_len_ + len > kMaxBody) flush(false);
     if (n > kMaxSegments || len > kMaxBody) return;  // 20ms の音声パケットではありえない大きさ
 
     memcpy(segs_ + nsegs_, segs, n);
@@ -113,13 +115,12 @@ void OggOpusWriter::add_packet(const uint8_t* packet, size_t len, uint32_t sampl
     body_len_ += len;
     packets_++;
     granule_ += samples_48k;
-
-    if (packets_ >= kPacketsPerPage) flush(false);
 }
 
 void OggOpusWriter::flush(bool eos) {
     if (nsegs_ == 0 && !eos) return;
-    emit_page(segs_, nsegs_, body_, body_len_, eos ? kFlagEos : 0, granule_);
+    // 音声を 1 つも書かずに閉じたときだけ、終わりの印だけの空のページになる（granule は -1）
+    emit_page(segs_, nsegs_, body_, body_len_, eos ? kFlagEos : 0, nsegs_ == 0 ? UINT64_MAX : granule_);
     nsegs_ = 0;
     body_len_ = 0;
     packets_ = 0;

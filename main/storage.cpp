@@ -40,7 +40,7 @@ constexpr uint32_t kCardCheckMs = 2000;  // 挿さっている間の確認の間
 constexpr uint32_t kRemountMs = 3000;    // 抜かれている間に認識し直す間隔
 constexpr int kQueueDepth = 64;  // Ogg ページ（約 1 秒分）× 64
 
-enum class MsgType : uint8_t { Open, Data, Close, Log, Shutdown };
+enum class MsgType : uint8_t { Open, Data, Close, Log, FlushLog, Shutdown };
 
 struct Msg {
     MsgType type;
@@ -242,6 +242,16 @@ void writer_task(void*) {
                     write_log(m.data, m.len);
                     heap_caps_free(m.data);
                     break;
+                case MsgType::FlushLog:
+                    // ここまでに積まれたログは書き終えている。すぐ確定する
+                    if (log_fp && log_dirty) {
+                        SpiLockGuard lock;
+                        fflush(log_fp);
+                        fsync(fileno(log_fp));
+                        log_dirty = false;
+                        last_log_sync = millis32();
+                    }
+                    break;
                 case MsgType::Shutdown:
                     // ここまでに積まれた書き込みは処理済み。ファイルを閉じて SD を外す
                     close_fp();
@@ -352,6 +362,13 @@ void append_log(const char* line) {
     if (!m.data) return;
     memcpy(m.data, line, m.len);
     if (xQueueSend(s_queue, &m, 0) != pdTRUE) heap_caps_free(m.data);
+}
+
+void flush_log() {
+    if (!s_queue || s_stopped) return;
+    Msg m = {};
+    m.type = MsgType::FlushLog;
+    xQueueSend(s_queue, &m, 0);
 }
 
 bool shutdown(uint32_t timeout_ms) {

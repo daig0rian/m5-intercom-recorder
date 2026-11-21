@@ -33,9 +33,11 @@ constexpr Note kPowerOn[] = {{kC5, kNoteMs}, {kE5, kNoteMs}, {kG5, kNoteMs}};
 constexpr Note kPowerOff[] = {{kG5, kNoteMs}, {kE5, kNoteMs}, {kC5, kNoteMs}};
 constexpr Note kRecStart[] = {{kG5, kNoteMs}, {kC6, kNoteMs}};
 constexpr Note kRecStop[] = {{kC6, kNoteMs}, {kG5, kNoteMs}};
-// 同期信号は時報と同じ音程（予報音 A4、正報音 A5）
-constexpr Note kSyncPip[] = {{440.0f, kSyncPipMs}};
-constexpr Note kSyncMark[] = {{880.0f, kSyncMarkMs}};
+// 映像同期の音。Core2 のスピーカーから B+COM のマイクを通して録ると、低い音ほど入りにくく（440Hz はほぼ入らない）、
+// 1320Hz あたりがいちばん入った。編集で波形の立ち上がりを見つけやすいよう、正報音は 1320Hz にする
+// （録音で約 -35dBFS。880Hz のときは約 -50dBFS だった）。予報音は、時報と同じく正報音の 1 オクターブ下（約 -43dBFS）
+constexpr Note kSyncPip[] = {{660.0f, kSyncPipMs}};
+constexpr Note kSyncMark[] = {{1320.0f, kSyncMarkMs}};
 
 QueueHandle_t s_queue = nullptr;
 std::atomic<int> s_pending{0};  // 鳴らし終わっていない操作音の数

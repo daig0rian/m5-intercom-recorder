@@ -21,6 +21,8 @@ bool close_file();
 
 // ログ 1 行を SD の LOG/YYYYMMDD.txt に書き足す（「ログを SD に保存」がオンのときだけ。どのタスクから呼んでもよい）
 void append_log(const char* line);
+// ここまでに書き足したログを、5 秒ごとの確定を待たずに SD に確定する（録音を閉じたとき。止めてすぐ SD を抜いても残るように）
+void flush_log();
 
 // 電源を切る前に呼ぶ。積まれた書き込みを終え、ファイルを閉じて SD を外す（終わるまで待つ）
 bool shutdown(uint32_t timeout_ms);

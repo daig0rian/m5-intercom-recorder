@@ -43,6 +43,14 @@ bool s_pending_valid = false;
 bool s_connecting_saved = false;  // 保存済みの接続先に接続しようとしている
 bool s_peer_bonded = false;       // 最後に接続した機器の鍵を Core2 が持っている
 
+// 録音中に思いがけず切れたら、最後に接続した機器へ定期的につなぎ直しを試みる。B+COM は、離れて切れたあと
+// 近づいても自分からはつなぎ直さない。録音中は接続先が変わらないので、つなぎ先を迷わない
+constexpr uint64_t kReconnectIntervalUs = 10 * 1000 * 1000;
+esp_timer_handle_t s_reconnect_timer = nullptr;
+std::atomic<bool> s_reconnecting{false};
+std::atomic<bool> s_disc_requested{false};  // こちらから切った（このときはつなぎ直さない）
+int s_reconnect_tries = 0;
+
 std::atomic<bool> s_audio_on{false};
 std::atomic<uint32_t> s_rate{0};
 uint16_t s_sync_handle = 0;
@@ -135,6 +143,35 @@ void forget_peer() {
     s_peer_bonded = false;
     memset(s_peer, 0, sizeof(s_peer));
     state_set_peer_name("");
+}
+
+// ---- 録音中のつなぎ直し -------------------------------------------------------
+
+void start_reconnect() {
+    if (s_reconnecting.exchange(true)) return;
+    s_reconnect_tries = 0;
+    char name[40];
+    state_get_peer_name(name, sizeof(name));
+    event_log("録音中に切れたので、%.30s につなぎ直します", name);
+    esp_timer_start_periodic(s_reconnect_timer, kReconnectIntervalUs);
+}
+
+void stop_reconnect(const char* why) {
+    if (!s_reconnecting.exchange(false)) return;
+    esp_timer_stop(s_reconnect_timer);
+    if (why) event_log("つなぎ直しをやめました（%s）", why);
+}
+
+// 試すたびにはログに書かない（つながらない間、ログがあふれるため）。失敗の知らせも、つなぎ直しの間は書かない
+void reconnect_cb(void*) {
+    if (!g_state.rec_requested.load()) return stop_reconnect("録音を止めた");
+    if (!s_has_peer || !s_peer_bonded) return stop_reconnect("ペアリング情報がない");
+    if (g_state.bt_state.load() != BtState::Idle) return;  // つなぎに行っている・向こうからつないできた
+    s_reconnect_tries++;
+    ESP_LOGI(TAG, "reconnect try %d", s_reconnect_tries);
+    g_state.bt_state.store(BtState::Connecting);
+    s_connecting_saved = true;
+    esp_hf_ag_slc_connect(s_peer);
 }
 
 // ---- 音声データ ----------------------------------------------------------
@@ -296,6 +333,11 @@ void hf_cb(esp_hf_cb_event_t event, esp_hf_cb_param_t* p) {
                 memcpy(s_peer, p->conn_stat.remote_bda, 6);
                 s_has_peer = true;
                 s_connecting_saved = false;
+                s_disc_requested.store(false);
+                if (s_reconnecting.load()) {
+                    event_log("つなぎ直しました（%d 回目）", s_reconnect_tries);
+                    stop_reconnect(nullptr);
+                }
                 g_state.bt_state.store(BtState::Connected);
                 // HF の機能フラグ 0x10 = 音量・マイク感度の遠隔設定に対応（BTA_AG_PEER_FEAT_VOL）
                 g_state.hf_remote_volume.store((p->conn_stat.peer_feat & 0x10) != 0);
@@ -315,7 +357,7 @@ void hf_cb(esp_hf_cb_event_t event, esp_hf_cb_param_t* p) {
                 esp_timer_start_once(s_auto_audio_timer, kAutoAudioDelayUs);
             } else if (st == ESP_HF_CONNECTION_STATE_DISCONNECTED) {
                 bool was_connected = g_state.bt_state.load() >= BtState::Connected;
-                event_log(was_connected ? "切断されました" : "接続できませんでした");
+                if (was_connected || !s_reconnecting.load()) event_log(was_connected ? "切断されました" : "接続できませんでした");
                 if (!was_connected) {
                     // つなぎに行って失敗した: 選んでいた機器のことは忘れ、最後に接続した機器を元に戻す
                     clear_pending();
@@ -326,6 +368,10 @@ void hf_cb(esp_hf_cb_event_t event, esp_hf_cb_param_t* p) {
                 s_connecting_saved = false;
                 on_audio_disconnected();
                 g_state.bt_state.store(BtState::Idle);
+                if (was_connected && !s_disc_requested.load() && g_state.rec_requested.load() && s_has_peer &&
+                    s_peer_bonded) {
+                    start_reconnect();
+                }
             }
             break;
         }
@@ -620,6 +666,10 @@ void init() {
     t.callback = tx_timer_cb;
     t.name = "hf_tx";
     ESP_ERROR_CHECK(esp_timer_create(&t, &s_tx_timer));
+    esp_timer_create_args_t r = {};
+    r.callback = reconnect_cb;
+    r.name = "reconnect";
+    ESP_ERROR_CHECK(esp_timer_create(&r, &s_reconnect_timer));
 
     esp_bt_gap_register_callback(gap_cb);
     esp_bt_gap_set_device_name(kLocalName);
@@ -727,6 +777,7 @@ void connect_paired(const uint8_t bda[6], const char* name) {
         return;
     }
     stop_discovery();
+    s_disc_requested.store(false);
     memcpy(s_peer, bda, 6);
     s_has_peer = true;
     s_peer_bonded = true;
@@ -752,6 +803,7 @@ void remove_pairing(const uint8_t bda[6]) {
 
 void connect_to(const uint8_t bda[6], const char* name) {
     stop_discovery();
+    s_disc_requested.store(false);
     memcpy(s_peer, bda, 6);
     s_has_peer = true;
     set_pending(bda, name);
@@ -771,6 +823,7 @@ bool connect_saved() {
     if (!s_has_peer) return false;
     BtState st = g_state.bt_state.load();
     if (st != BtState::Idle) return true;
+    s_disc_requested.store(false);
     g_state.bt_state.store(BtState::Connecting);
     s_connecting_saved = true;
     char name[40];
@@ -781,7 +834,11 @@ bool connect_saved() {
     return true;
 }
 
+bool reconnecting() { return s_reconnecting.load(); }
+
 void disconnect() {
+    s_disc_requested.store(true);  // 自分で切ったときは、つなぎ直さない
+    stop_reconnect("切断した");
     s_tx_active.store(false);  // 先に送信の合図を止める
     esp_timer_stop(s_auto_audio_timer);
     if (g_state.bt_state.load() >= BtState::Connecting) esp_hf_ag_slc_disconnect(s_peer);

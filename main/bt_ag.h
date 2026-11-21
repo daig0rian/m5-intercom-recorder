@@ -40,7 +40,10 @@ void remove_pairing(const uint8_t bda[6]);
 void connect_to(const uint8_t bda[6], const char* name);
 // 保存済みの接続先に接続する。保存がなければ false
 bool connect_saved();
+// 切る。録音中のつなぎ直しもやめる
 void disconnect();
+// 録音中に切れて、最後に接続した機器へのつなぎ直しを続けている（つながる・録音を止める・切断するまで）
+bool reconnecting();
 
 // 診断用: 音声接続だけを開く・閉じる
 void audio_open();
