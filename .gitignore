@@ -1,0 +1,7 @@
+build/
+managed_components/
+sdkconfig
+sdkconfig.old
+.vscode/
+eim_config.toml
+CLAUDE.local.md

@@ -1,0 +1,41 @@
+dependencies:
+  espressif/esp_audio_codec:
+    component_hash: a5b9275af74247e3ce536d16a7080e4d77207a185b63e1bea368eb4d57176c2b
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=4.4'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 2.6.2
+  idf:
+    source:
+      type: idf
+    version: 5.5.6
+  m5stack/m5gfx:
+    component_hash: e97781f48f14c6c65b90ba7cfe27deb3ff7eae8ec61a60040ab3615d166c82f4
+    dependencies: []
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 0.2.36
+  m5stack/m5unified:
+    component_hash: 4fd004b68526b3af3df4f3a4f20ae8698517d3a70951fc9b1903c95473d1608d
+    dependencies:
+    - name: m5stack/m5gfx
+      registry_url: https://components.espressif.com
+      require: private
+      version: '>=0.2.35'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 0.2.29
+direct_dependencies:
+- espressif/esp_audio_codec
+- idf
+- m5stack/m5gfx
+- m5stack/m5unified
+manifest_hash: 30dbfe885be9871b518d590d5ad61e873aaecbdea9cc2bbf0143e91671eee7ef
+target: esp32
+version: 2.0.0
