@@ -73,6 +73,19 @@ std::atomic<uint32_t> s_audio_req_ms{0};
 constexpr uint32_t kAudioReqTimeoutMs = 3000;
 void mark_audio_request() { s_audio_req_ms.store(millis32() | 1); }
 
+// 音声接続の開き直し（audio_reopen）。閉じたら開く。開けなければ、開けるか SLC が切れるまで試し続ける
+std::atomic<bool> s_reopening{false};
+esp_timer_handle_t s_reopen_timer = nullptr;
+constexpr uint64_t kReopenOpenDelayUs = 500 * 1000;       // 閉じてから開くまで
+constexpr uint64_t kReopenRetryUs = 5 * 1000 * 1000;      // 開けないときに試し直す間隔
+
+// 受信パケットの誤り（2 秒ごとの割合）が多いことをログに残す。多くなったときと、減ったときに 1 行ずつ
+constexpr int kErrHighPct = 25;
+constexpr int kErrLowPct = 10;
+bool s_err_high = false;
+int64_t s_err_high_since_us = 0;
+int s_err_high_max = 0;
+
 // ループバック（受信した声を遅らせてインカムへ返す）
 constexpr size_t kLoopbackCapacity = 16000 * 2;  // 16kHz で 2 秒分（遅れの分＋余裕）
 PcmRing s_loop_ring;
@@ -253,6 +266,7 @@ uint32_t s_drop_prev_total = 0, s_drop_prev_bad = 0;
 void reset_drop_rate() {
     s_drop_prev_total = s_drop_prev_bad = 0;
     g_state.pkt_drop_x10.store(-1);
+    s_err_high = false;
 }
 
 void update_drop_rate(uint32_t total, uint32_t bad) {
@@ -261,7 +275,24 @@ void update_drop_rate(uint32_t total, uint32_t bad) {
     uint32_t d_bad = bad >= s_drop_prev_bad ? bad - s_drop_prev_bad : bad;
     s_drop_prev_total = total;
     s_drop_prev_bad = bad;
-    if (d_total > 0) g_state.pkt_drop_x10.store(static_cast<int16_t>(d_bad * 1000 / d_total));
+    if (d_total == 0) return;
+    int x10 = static_cast<int>(d_bad * 1000 / d_total);
+    g_state.pkt_drop_x10.store(static_cast<int16_t>(x10));
+
+    int pct = x10 / 10;
+    if (!s_err_high && pct >= kErrHighPct) {
+        s_err_high = true;
+        s_err_high_since_us = esp_timer_get_time();
+        s_err_high_max = pct;
+        event_log("受信の誤りが多くなりました（%d%%）", pct);
+    } else if (s_err_high) {
+        s_err_high_max = std::max(s_err_high_max, pct);
+        if (pct < kErrLowPct) {
+            s_err_high = false;
+            event_log("受信の誤りが減りました（多かったのは %lu 秒、最大 %d%%）",
+                      (unsigned long)((esp_timer_get_time() - s_err_high_since_us) / 1000000), s_err_high_max);
+        }
+    }
 }
 
 // SLC がつながって少ししてから: 保存したマイク感度を指示し（インカムが対応している場合だけ）、音声接続を開く
@@ -280,7 +311,28 @@ void auto_audio_cb(void*) {
     }
 }
 
+// 開き直しの途中で、開けなかった・閉じなかったときに試し直す（開けるか SLC が切れるまで）
+void reopen_cb(void*) {
+    if (!s_reopening.load()) return;
+    if (g_state.bt_state.load() < BtState::Connected) {
+        s_reopening.store(false);
+        esp_timer_stop(s_reopen_timer);
+        return;
+    }
+    if (audio_busy()) return;
+    mark_audio_request();
+    if (s_audio_on.load()) {
+        ESP_LOGW(TAG, "reopen: 閉じなかったので、もう一度閉じる");
+        s_tx_active.store(false);
+        esp_hf_ag_audio_disconnect(s_peer);
+    } else {
+        ESP_LOGW(TAG, "reopen: 開けなかったので、もう一度開く");
+        esp_hf_ag_audio_connect(s_peer);
+    }
+}
+
 void on_audio_connected(uint32_t rate, Codec codec, uint16_t handle) {
+    if (s_reopening.exchange(false)) esp_timer_stop(s_reopen_timer);
     s_audio_req_ms.store(0);
     s_rate.store(rate);
     s_sync_handle = handle;
@@ -366,6 +418,7 @@ void hf_cb(esp_hf_cb_event_t event, esp_hf_cb_param_t* p) {
                 g_state.hf_mic_gain.store(-1);
                 g_state.hf_remote_volume.store(false);
                 s_connecting_saved = false;
+                if (s_reopening.exchange(false)) esp_timer_stop(s_reopen_timer);
                 on_audio_disconnected();
                 g_state.bt_state.store(BtState::Idle);
                 if (was_connected && !s_disc_requested.load() && g_state.rec_requested.load() && s_has_peer &&
@@ -387,6 +440,11 @@ void hf_cb(esp_hf_cb_event_t event, esp_hf_cb_param_t* p) {
                 event_log("音声切断");
                 on_audio_disconnected();
                 if (g_state.bt_state.load() == BtState::AudioOn) g_state.bt_state.store(BtState::Connected);
+                // 開き直しの途中なら、少し置いてから開く（auto_audio_cb が開く）
+                if (s_reopening.load() && g_state.bt_state.load() == BtState::Connected) {
+                    esp_timer_stop(s_auto_audio_timer);
+                    esp_timer_start_once(s_auto_audio_timer, kReopenOpenDelayUs);
+                }
             }
             break;
         }
@@ -670,6 +728,10 @@ void init() {
     r.callback = reconnect_cb;
     r.name = "reconnect";
     ESP_ERROR_CHECK(esp_timer_create(&r, &s_reconnect_timer));
+    esp_timer_create_args_t o = {};
+    o.callback = reopen_cb;
+    o.name = "reopen";
+    ESP_ERROR_CHECK(esp_timer_create(&o, &s_reopen_timer));
 
     esp_bt_gap_register_callback(gap_cb);
     esp_bt_gap_set_device_name(kLocalName);
@@ -858,10 +920,23 @@ void audio_open() {
 
 void audio_close() {
     if (audio_busy() || !s_audio_on.load()) return;
+    if (s_reopening.exchange(false)) esp_timer_stop(s_reopen_timer);  // 閉じたままにする
     mark_audio_request();
     s_tx_active.store(false);  // 先に送信の合図を止める
     event_log("音声接続を閉じます");
     esp_hf_ag_audio_disconnect(s_peer);
+}
+
+bool audio_reopen() {
+    if (!s_audio_on.load() || audio_busy() || s_reopening.load()) return false;
+    s_reopening.store(true);
+    event_log("音声接続を開き直します");
+    mark_audio_request();
+    s_tx_active.store(false);  // 先に送信の合図を止める
+    esp_hf_ag_audio_disconnect(s_peer);
+    esp_timer_stop(s_reopen_timer);
+    esp_timer_start_periodic(s_reopen_timer, kReopenRetryUs);
+    return true;
 }
 
 void set_mic_gain(int gain) {

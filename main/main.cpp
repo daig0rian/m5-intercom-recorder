@@ -1,4 +1,4 @@
-// m5-intercom-recorder: バイク用インカムの通話音声を M5Stack Core2 で受け取り、SD カードに Opus で録音する
+// m5-intercom-recorder: バイク用インカムの通話音声を M5Stack Core2 で受け取り、SD カードに WAV で録音する
 #include "M5Unified.h"
 #include "app_state.h"
 #include "audio_pipeline.h"

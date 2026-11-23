@@ -17,7 +17,6 @@ static const char* TAG = "clock";
 namespace rtc_clock {
 namespace {
 
-constexpr int kMinValidYear = 2025;
 
 void set_system_time(const struct tm& local) {
     struct tm t = local;
@@ -136,8 +135,16 @@ void init() {
         ESP_LOGW(TAG, "RTC の時刻が無効なので、ビルド日時を使います");
         if (M5.Rtc.isEnabled()) write_rtc(t);
         set_system_time(t);
-        event_log("RTC未設定: settime.txt で合わせてください");
+        event_log("RTC未設定: メニューの「時刻合わせ」で合わせてください");
     }
+}
+
+void set(const struct tm& local) {
+    struct tm t = local;
+    t.tm_isdst = 0;
+    mktime(&t);  // 曜日（tm_wday）を求める
+    write_rtc(t);
+    set_system_time(t);
 }
 
 void local_now(struct tm* out) {

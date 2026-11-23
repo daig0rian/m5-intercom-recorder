@@ -15,7 +15,8 @@ bool mount();
 void start_writer_task();
 
 // 以下は audio タスクから呼ぶ。キューが一杯なら false（データは捨て、数を数える）
-bool open_file(const char* path);
+// wav: WAV ファイル。書き込みを確定するたびに、頭の長さを書き直す
+bool open_file(const char* path, bool wav);
 bool write(const uint8_t* a, size_t a_len, const uint8_t* b, size_t b_len);
 bool close_file();
 
@@ -23,6 +24,10 @@ bool close_file();
 void append_log(const char* line);
 // ここまでに書き足したログを、5 秒ごとの確定を待たずに SD に確定する（録音を閉じたとき。止めてすぐ SD を抜いても残るように）
 void flush_log();
+
+// カードを FAT32 に初期化する（2GB 以下のカードは FAT16）。中身はすべて消える。FAT として読めないカード
+// （exFAT など）も初期化できる。録音していないときに UI から呼ぶ。終わるまで待ち、成功したら true
+bool format_card(uint32_t timeout_ms);
 
 // 電源を切る前に呼ぶ。積まれた書き込みを終え、ファイルを閉じて SD を外す（終わるまで待つ）
 bool shutdown(uint32_t timeout_ms);

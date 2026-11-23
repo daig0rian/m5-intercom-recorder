@@ -6,7 +6,6 @@ idf_component_register(
         "bt_ag.cpp"
         "bt_sc_guard.c"
         "level_meter.cpp"
-        "ogg_opus_writer.cpp"
         "pcm_ring.cpp"
         "rtc_clock.cpp"
         "settings.cpp"
@@ -14,6 +13,7 @@ idf_component_register(
         "spi_lock.cpp"
         "storage.cpp"
         "ui.cpp"
+        "wav_writer.cpp"
     INCLUDE_DIRS "."
 )
 

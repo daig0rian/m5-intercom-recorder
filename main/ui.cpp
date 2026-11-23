@@ -63,7 +63,7 @@ constexpr float kClipLedDb = -1.0f;
 constexpr uint32_t kHoldMs = 1500;          // ピークホールドを保つ時間
 constexpr float kHoldFallDbPerSec = 20.0f;  // その後ピークホールドが下がる速さ
 
-enum class Screen { Main, Menu, Devices, Log, Sync };
+enum class Screen { Main, Menu, Devices, Log, Sync, Clock };
 
 M5Canvas s_cv(&M5.Display);
 M5Canvas s_vu(&M5.Display);
@@ -83,7 +83,6 @@ uint32_t s_meter_ms = 0;
 uint32_t s_stat_ms = 0;
 uint32_t s_rate_last_bytes = 0;
 uint32_t s_rx_kbps_x10 = 0;
-uint32_t s_encode_us = 0;
 int s_battery = -1;
 bool s_charging = false;
 
@@ -280,7 +279,8 @@ void update_meters(uint32_t now) {
 // 残量の % は、AXP2101（Core2 v1.1）は電源 IC の残量計の値を使う。AXP192（Core2 初期型・v1.3）は残量計を持たず、
 // M5Unified は電池の電圧から直線で出す（3.3V = 0%、4.1V = 100%）。リポ電池の電圧は終わりに急に下がるので、
 // それでは表示が最後に急に減り、0% になる前に電源 IC が電源を切ることもある。そこで AXP192 では、
-// 録音中（消灯）に電池が切れるまで測った電圧の下がり方から、% が録音できる残り時間に比例するよう表で換算する。
+// 録音中（消灯）に電池が切れるまで測った電圧の下がり方から、% が録音できる残り時間に比例するよう表で換算する
+// （消費電力はほぼ一定なので、% は「残りのエネルギー（電圧×電流の積算）」の割合にしている）。
 // 0% は 3.5V とし、電源 IC が自分で切る 3.0V までに数分の余裕を残す（3.3V で切るより、録音できる時間が約 2% 減る）。
 // 電圧は流れる電流で下がる（画面を点けると 10mV ほど）ので、電圧をならしてから換算し、電池で動いている間は
 // 表示を増やさない。
@@ -288,11 +288,13 @@ struct LevelPoint {
     int16_t mv;
     int8_t pct;
 };
-// 電圧の高い順。録音中（消灯、約 135mA）に測った電圧。点の間は直線で結ぶ。
-// 下の端は電圧が急に下がるので点を細かくする。4.1V より上は 100%（そこから先は外挿で、まだ測っていない）。
+// 電圧の高い順。録音中（消灯、約 120〜140mA）に測った電圧。点の間は直線で結ぶ。
+// 満充電（充電の表示が消えてから）で USB を抜くと約 4.12V から始まり、4.0V より上が全体の 11%。
+// 4.0V より下は、満充電でなかった 2 回を含む 3 回の試験の平均で、3 回の差は 6mV 以内。
+// 下の端は電圧が急に下がるので点を細かくする。
 constexpr LevelPoint kAxp192Levels[] = {
-    {4100, 100}, {4011, 90}, {3924, 80}, {3864, 70}, {3805, 60}, {3754, 50}, {3718, 40}, {3697, 30},
-    {3673, 20},  {3621, 10}, {3600, 5},  {3583, 3},  {3566, 2},  {3545, 1},  {3500, 0},
+    {4116, 100}, {4088, 99}, {4047, 95}, {4013, 90}, {3926, 80}, {3866, 70}, {3805, 60}, {3756, 50}, {3721, 40},
+    {3699, 30},  {3675, 20}, {3622, 10}, {3604, 5},  {3587, 3},  {3569, 2},  {3545, 1},  {3500, 0},
 };
 // USB を抜いた直後は、充電で上がっていた電圧が数秒で下がる（4.09V → 3.95V を 3 秒）。
 // その高い電圧からならし始めないよう、電池で動き始めてから kFollowMs の間は、ならさずに電圧に従う
@@ -420,7 +422,6 @@ void update_stats(uint32_t now) {
     s_rx_kbps_x10 = (bytes - s_rate_last_bytes) * 10 / 1024 * 1000 / std::max<uint32_t>(now - s_stat_ms, 1);
     s_rate_last_bytes = bytes;
     s_stat_ms = now;
-    s_encode_us = g_state.encode_us_max.exchange(0);
     read_power();
 }
 
@@ -447,7 +448,7 @@ void draw_main() {
     } else if (g_state.loopback.load()) {
         text(kFont16, kAccent, 6, 3, "ループバック中");
     } else if (!g_state.sd_mounted.load()) {
-        text(kFont16, kOrange, 6, 3, "SDカードがありません");
+        text(kFont16, kOrange, 6, 3, g_state.sd_unreadable.load() ? "SDカードが読めません" : "SDカードがありません");
     } else {
         text(kFont16, kDim, 6, 3, "待機中");
     }
@@ -481,10 +482,8 @@ void draw_main() {
     text(kFont12, kText, 6, y, b);
     y += lh;
     uint32_t free_mb = g_state.sd_free_mb.load();
-    snprintf(b, sizeof(b), "書込 %luKB  エラー %lu  エンコード %lu.%lums  空き %lu.%luGB",
-             (unsigned long)(g_state.bytes_written.load() / 1024),
+    snprintf(b, sizeof(b), "書込 %luMB  エラー %lu  空き %lu.%luGB", (unsigned long)(g_state.written_kb.load() / 1024),
              (unsigned long)(g_state.write_errors.load() + g_state.write_queue_drops.load()),
-             (unsigned long)(s_encode_us / 1000), (unsigned long)(s_encode_us % 1000 / 100),
              (unsigned long)(free_mb / 1024), (unsigned long)(free_mb % 1024 * 10 / 1024));
     text(kFont12, kText, 6, y, b);
     y += lh + 2;
@@ -513,12 +512,14 @@ enum MenuRow {
     kRowAudio,
     kRowLoopback,
     kRowSync,
+    kRowClock,
     kRowMicGain,
     kRowSplit,
     kRowLogView,
     kRowLogSd,
     kRowReconnect,
     kRowBrightness,
+    kRowSdFormat,
     kRowReset,
     kMenuRows
 };
@@ -558,8 +559,13 @@ constexpr int kResetBtnW = 84;
 constexpr int kResetBtnX = kW - 16 - kResetBtnW;
 constexpr uint32_t kResetConfirmMs = 3000;  // 「初期化する?」を押すまでの猶予
 uint32_t s_reset_armed_until = 0;
+uint32_t s_format_armed_until = 0;  // 「SD カードの初期化」も同じように 2 回押す
 
 bool reset_armed() { return millis32() < s_reset_armed_until; }
+bool format_armed() { return millis32() < s_format_armed_until; }
+
+// 初期化できるカードが入っている（読めるカードか、応えるが FAT として読めないカード）
+bool sd_card_present() { return g_state.sd_mounted.load() || g_state.sd_unreadable.load(); }
 
 // スライド式のトグル。busy は切り替え中（つまみを真ん中に置く）
 void toggle_switch(int y_center, bool on, bool enabled, bool busy) {
@@ -607,6 +613,21 @@ void draw_menu() {
                 text(kFont16, kText, 16, yc, "映像同期", textdatum_t::middle_left);
                 text(kFont12, kDim, kRowNoteX, yc, "映像と音を合わせる", textdatum_t::middle_left);
                 break;
+            case kRowClock: {
+                // 録音中は変えられない（ファイル名や区切りの時刻がどうなるか分かりにくくなるため）
+                bool rec = g_state.rec_requested.load();
+                text(kFont16, rec ? kDim : kText, 16, yc, "時刻合わせ", textdatum_t::middle_left);
+                if (rec) {
+                    text(kFont12, kDim, kRowNoteX, yc, "録音中変更不可", textdatum_t::middle_left);
+                } else {
+                    struct tm t;
+                    rtc_clock::local_now(&t);
+                    char b[24];
+                    strftime(b, sizeof(b), "%Y-%m-%d %H:%M", &t);
+                    text(kFont12, kDim, kRowNoteX, yc, b, textdatum_t::middle_left);
+                }
+                break;
+            }
             case kRowMicGain: {
                 // インカムが遠隔設定に対応していないときは灰色にして押せないようにする
                 bool usable = connected && g_state.hf_remote_volume.load();
@@ -645,6 +666,23 @@ void draw_menu() {
                 text(kFont16, kText, 16, yc, "画面の明るさ", textdatum_t::middle_left);
                 text(kFont16, kText, kW - 16, yc, kBrightnessName[s_brightness], textdatum_t::middle_right);
                 break;
+            case kRowSdFormat: {
+                // 録音中と、カードが入っていないときは使えない
+                bool rec = g_state.rec_requested.load();
+                bool usable = !rec && sd_card_present();
+                bool armed = usable && format_armed();
+                text(kFont16, usable ? kText : kDim, 16, yc, "SDカード初期化", textdatum_t::middle_left);
+                const char* note = rec                            ? "録音中変更不可"
+                                   : !sd_card_present()           ? "カードなし"
+                                   : g_state.sd_unreadable.load() ? "読めないカード"
+                                                                  : "全部消えます";
+                // 見出しが長いので、添え書きは少し右に置く（右のボタンにかからない幅）
+                text(kFont12, kDim, kRowNoteX + 14, yc, note, textdatum_t::middle_left);
+                s_cv.fillRoundRect(kResetBtnX, yc - 12, kResetBtnW, 25, 4, !usable ? 0x2945 : armed ? kRed : 0x4208);
+                text(kFont12, usable ? kText : kDim, kResetBtnX + kResetBtnW / 2, yc, armed ? "初期化する?" : "初期化",
+                     textdatum_t::middle_center);
+                break;
+            }
             case kRowReset: {
                 // 録音中は使えない（初期化は再起動するので、録音が止まる）
                 bool rec = g_state.rec_requested.load();
@@ -995,6 +1033,133 @@ void sync_stop() {
     sound::set_loud(false);
 }
 
+// ---- 時刻合わせ ------------------------------------------------------------
+// 年・月・日・時・分を＋−で選び、時刻が 0 秒ちょうどになったときに「合わせる」を押す。
+// 押した瞬間をその分の 0 秒にするので、秒を合わせる操作は要らない（ずれは押す速さの分で済む）。
+// 開いたときは、いまの時刻の次の分を入れておく（少しずれているだけなら、分を少し直せば済む）。
+
+void go(Screen s);
+
+enum ClockField { kClkYear, kClkMonth, kClkDay, kClkHour, kClkMinute, kClkFields };
+constexpr int kClkColX[kClkFields] = {46, 112, 166, 238, 292};  // 各欄の真ん中
+constexpr const char* kClkLabel[kClkFields] = {"年", "月", "日", "時", "分"};
+constexpr int kClkLabelY = 52;
+constexpr int kClkPlusY = 68;    // ＋の上端
+constexpr int kClkValueY = 111;  // 数字の真ん中
+constexpr int kClkMinusY = 130;  // −の上端
+constexpr int kClkBtnW = 46;
+constexpr int kClkBtnH = 26;
+int s_clk[kClkFields] = {};
+
+int days_in_month(int y, int m) {
+    static constexpr int kDays[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    bool leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    return m == 2 && leap ? 29 : kDays[m - 1];
+}
+
+void clock_open() {
+    time_t next = time(nullptr) + 60;
+    struct tm t;
+    localtime_r(&next, &t);
+    s_clk[kClkYear] = std::max(t.tm_year + 1900, rtc_clock::kMinValidYear);
+    s_clk[kClkMonth] = t.tm_mon + 1;
+    s_clk[kClkDay] = t.tm_mday;
+    s_clk[kClkHour] = t.tm_hour;
+    s_clk[kClkMinute] = t.tm_min;
+}
+
+void clock_step(int field, int step) {
+    auto wrap = [](int v, int lo, int hi) { return v < lo ? hi : v > hi ? lo : v; };
+    int& v = s_clk[field];
+    switch (field) {
+        case kClkYear: v = std::clamp(v + step, rtc_clock::kMinValidYear, 2099); break;
+        case kClkMonth: v = wrap(v + step, 1, 12); break;
+        case kClkDay: v = wrap(v + step, 1, days_in_month(s_clk[kClkYear], s_clk[kClkMonth])); break;
+        case kClkHour: v = wrap(v + step, 0, 23); break;
+        case kClkMinute: v = wrap(v + step, 0, 59); break;
+    }
+    // 年や月を変えて、その月にない日になったら月末にする
+    s_clk[kClkDay] = std::min(s_clk[kClkDay], days_in_month(s_clk[kClkYear], s_clk[kClkMonth]));
+}
+
+void draw_clock() {
+    status_bar("時刻合わせ");
+    struct tm now;
+    rtc_clock::local_now(&now);
+    char b[48];
+    strftime(b, sizeof(b), "いまの時刻  %Y-%m-%d %H:%M:%S", &now);
+    text(kFont16, kText, kW / 2, 28, b, textdatum_t::top_center);
+    for (int i = 0; i < kClkFields; i++) {
+        int x = kClkColX[i];
+        text(kFont12, kDim, x, kClkLabelY, kClkLabel[i], textdatum_t::middle_center);
+        s_cv.fillRoundRect(x - kClkBtnW / 2, kClkPlusY, kClkBtnW, kClkBtnH, 4, 0x4208);
+        text(kFont16, kText, x, kClkPlusY + kClkBtnH / 2, "＋", textdatum_t::middle_center);
+        snprintf(b, sizeof(b), i == kClkYear ? "%04d" : "%02d", s_clk[i]);
+        text(&fonts::Font4, kText, x, kClkValueY, b, textdatum_t::middle_center);
+        s_cv.fillRoundRect(x - kClkBtnW / 2, kClkMinusY, kClkBtnW, kClkBtnH, 4, 0x4208);
+        text(kFont16, kText, x, kClkMinusY + kClkBtnH / 2, "−", textdatum_t::middle_center);
+    }
+    text(&fonts::Font4, kText, (kClkColX[kClkHour] + kClkColX[kClkMinute]) / 2, kClkValueY, ":",
+         textdatum_t::middle_center);
+    text(kFont12, kText, kW / 2, 170, "時刻が 0 秒ちょうどになったときに", textdatum_t::top_center);
+    text(kFont12, kText, kW / 2, 187, "「合わせる」を押してください", textdatum_t::top_center);
+    buttons("", "合わせる", "戻る");
+}
+
+void clock_apply() {
+    if (g_state.rec_requested.load()) return;  // 録音中は開けないが、念のため
+    time_t before = time(nullptr);
+    struct tm t = {};
+    t.tm_year = s_clk[kClkYear] - 1900;
+    t.tm_mon = s_clk[kClkMonth] - 1;
+    t.tm_mday = s_clk[kClkDay];
+    t.tm_hour = s_clk[kClkHour];
+    t.tm_min = s_clk[kClkMinute];
+    t.tm_sec = 0;
+    t.tm_isdst = 0;
+    struct tm tmp = t;
+    time_t after = mktime(&tmp);
+    rtc_clock::set(t);
+    // どれだけずれていたかも残す（正なら、それまで遅れていた）
+    long diff = static_cast<long>(after - before);
+    char was[40];
+    if (diff == 0) {
+        snprintf(was, sizeof(was), "ずれなし");
+    } else if (diff > -86400 && diff < 86400) {
+        snprintf(was, sizeof(was), "%ld 秒%s", diff > 0 ? diff : -diff, diff > 0 ? "遅れていた" : "進んでいた");
+    } else {
+        struct tm old;
+        localtime_r(&before, &old);
+        strftime(was, sizeof(was), "前 %Y-%m-%d %H:%M", &old);
+    }
+    event_log("時刻合わせ %04d-%02d-%02d %02d:%02d:00（%s）", s_clk[kClkYear], s_clk[kClkMonth], s_clk[kClkDay],
+              s_clk[kClkHour], s_clk[kClkMinute], was);
+    toast("時刻を合わせました");
+    go(Screen::Menu);
+}
+
+void on_clock(int btn, int x, int y) {
+    if (btn == 2) {
+        go(Screen::Menu);
+        return;
+    }
+    if (btn == 1) {
+        clock_apply();
+        return;
+    }
+    if (btn >= 0) return;
+    int step = y >= kClkPlusY - 6 && y < kClkPlusY + kClkBtnH + 6     ? +1
+               : y >= kClkMinusY - 6 && y < kClkMinusY + kClkBtnH + 6 ? -1
+                                                                      : 0;
+    if (step == 0) return;
+    for (int i = 0; i < kClkFields; i++) {
+        if (x >= kClkColX[i] - kClkBtnW / 2 - 3 && x <= kClkColX[i] + kClkBtnW / 2 + 3) {
+            clock_step(i, step);
+            return;
+        }
+    }
+}
+
 void render_full() {
     auto compose = [] {
         s_cv.fillScreen(kBg);
@@ -1004,6 +1169,7 @@ void render_full() {
             case Screen::Devices: draw_devices(); break;
             case Screen::Log: draw_log(); break;
             case Screen::Sync: draw_sync(); break;
+            case Screen::Clock: draw_clock(); break;
         }
         draw_toast();
     };
@@ -1055,7 +1221,7 @@ void go(Screen s) {
         event_log("映像同期を開始");
         sync_start();
     }
-    static const char* kNames[] = {"main", "menu", "devices", "log", "sync"};
+    static const char* kNames[] = {"main", "menu", "devices", "log", "sync", "clock"};
     ESP_LOGI("ui", "screen %s", kNames[static_cast<int>(s)]);
 }
 
@@ -1066,7 +1232,7 @@ void toggle_rec() {
         return;
     }
     if (!g_state.sd_mounted.load()) {
-        toast("SD カードがありません");
+        toast(g_state.sd_unreadable.load() ? "SD カードが読めません" : "SD カードがありません");
         return;
     }
     // ループバックの声が通話相手に聞こえたり録音に混ざったりしないよう、録音中は止める
@@ -1095,6 +1261,22 @@ void on_main(int btn, int, int) {
 
 void graceful_shutdown(const char* message = "シャットダウン中です…", bool factory_reset = false);
 
+// 大きいカードでは FAT の表を書くのに時間がかかる。その間、液晶と同じバスを使うので画面は止まる
+constexpr uint32_t kFormatTimeoutMs = 10 * 60 * 1000;
+
+void format_sd() {
+    strlcpy(s_toast, "SD カードを初期化しています…", sizeof(s_toast));
+    s_toast_until = UINT32_MAX;
+    render_full();
+    event_log("SD カードの初期化を開始");
+    uint32_t t0 = millis32();
+    bool ok = storage::format_card(kFormatTimeoutMs);
+    uint32_t sec = (millis32() - t0) / 1000;
+    if (ok) event_log("SD カードを初期化しました（%lu 秒）", (unsigned long)sec);
+    else event_log("SD カードを初期化できませんでした（%lu 秒）", (unsigned long)sec);
+    toast(ok ? "SD カードを初期化しました" : "初期化できませんでした");
+}
+
 void on_menu(int btn, int x, int y) {
     if (btn == 2) {
         go(Screen::Main);
@@ -1122,6 +1304,11 @@ void on_menu(int btn, int x, int y) {
             break;
         case kRowSync:
             go(Screen::Sync);
+            break;
+        case kRowClock:
+            if (g_state.rec_requested.load()) break;  // 録音中は変えられない（行に「録音中変更不可」と出している）
+            clock_open();
+            go(Screen::Clock);
             break;
         case kRowMicGain: {
             if (st < BtState::Connected) {
@@ -1164,6 +1351,19 @@ void on_menu(int btn, int x, int y) {
         case kRowBrightness:
             s_brightness = (s_brightness + 1) % 3;
             M5.Display.setBrightness(kBrightness[s_brightness]);
+            break;
+        case kRowSdFormat:
+            if (g_state.rec_requested.load()) break;  // 録音中は使えない（行に「録音中変更不可」と出している）
+            if (!sd_card_present()) {
+                toast("SD カードを入れてください");
+                break;
+            }
+            if (format_armed() && x >= kResetBtnX - 6) {
+                s_format_armed_until = 0;
+                format_sd();
+            } else {
+                s_format_armed_until = millis32() + kResetConfirmMs;
+            }
             break;
         case kRowReset:
             if (g_state.rec_requested.load()) break;  // 録音中は使えない（行に「録音中変更不可」と出している）
@@ -1313,7 +1513,7 @@ void graceful_shutdown(const char* message, bool factory_reset) {
 
     bt_ag::set_loopback(false);
     g_state.rec_requested.store(false);
-    // audio タスクが最後の Ogg ページを書いてファイルを閉じるのを待つ
+    // audio タスクが最後のデータを書いてファイルを閉じるのを待つ
     wait_until([] { return !g_state.recording.load(); }, 1500);
     bool sd_ok = storage::shutdown(1500);
     if (g_state.bt_state.load() >= BtState::Connecting) {
@@ -1395,6 +1595,7 @@ bool handle_input() {
         case Screen::Devices: on_devices(btn, x, y); break;
         case Screen::Log: on_log(btn, x, y); break;
         case Screen::Sync: on_sync(btn, x, y); break;
+        case Screen::Clock: on_clock(btn, x, y); break;
     }
     return true;
 }

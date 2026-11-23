@@ -41,7 +41,6 @@ struct AppState {
     std::atomic<int16_t> level_peak_x10{kNoLevel};
     std::atomic<uint32_t> clip_frames{0};
     std::atomic<uint32_t> frames_processed{0};
-    std::atomic<uint32_t> encode_us_max{0};  // 1 フレームのエンコード時間（直近 1 秒の最大）
 
     // 録音
     std::atomic<bool> rec_requested{false};  // UI が立てる
@@ -55,8 +54,9 @@ struct AppState {
 
     // SD
     std::atomic<bool> sd_mounted{false};
+    std::atomic<bool> sd_unreadable{false};  // カードは応えるが、FAT として読めない（exFAT など）
     std::atomic<uint32_t> sd_free_mb{0};
-    std::atomic<uint32_t> bytes_written{0};
+    std::atomic<uint32_t> written_kb{0};  // 録音ファイルに書いた量（KB）
     std::atomic<uint32_t> write_errors{0};
     std::atomic<uint32_t> write_queue_drops{0};
 };

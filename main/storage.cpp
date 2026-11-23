@@ -3,6 +3,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
@@ -19,6 +20,7 @@
 #include "freertos/task.h"
 #include "sdmmc_cmd.h"
 #include "spi_lock.h"
+#include "wav_writer.h"
 
 static const char* TAG = "storage";
 
@@ -38,21 +40,27 @@ constexpr uint32_t kFreeSpaceIntervalMs = 30000;
 // Core2 の SD スロットにはカード検出の信号がないので、カードに問い合わせて抜き差しを知る
 constexpr uint32_t kCardCheckMs = 2000;  // 挿さっている間の確認の間隔
 constexpr uint32_t kRemountMs = 3000;    // 抜かれている間に認識し直す間隔
-constexpr int kQueueDepth = 64;  // Ogg ページ（約 1 秒分）× 64
+constexpr int kQueueDepth = 64;  // 録音のデータ（約 1 秒分）× 64
+// 液晶と同じバスなので、一度に書くのはこれだけにして、間で描画を通す
+constexpr size_t kWriteSliceBytes = 8192;
+// 初期化するときのクラスタの大きさ。大きいカードでも FAT の表が大きくなりすぎないように
+constexpr size_t kFormatAllocUnit = 32 * 1024;
 
-enum class MsgType : uint8_t { Open, Data, Close, Log, FlushLog, Shutdown };
+enum class MsgType : uint8_t { Open, Data, Close, Log, FlushLog, Shutdown, Format };
 
 struct Msg {
     MsgType type;
+    bool wav;  // Open: WAV なので、確定するたびに頭の長さを書き直す
     uint32_t len;
     uint8_t* data;
     char path[48];
-    SemaphoreHandle_t done;  // Shutdown の完了を知らせる
+    SemaphoreHandle_t done;  // Shutdown・Format の完了を知らせる
 };
 
 QueueHandle_t s_queue = nullptr;
 sdmmc_card_t* s_card = nullptr;
 bool s_stopped = false;  // シャットダウン後は抜き差しの確認もしない
+esp_err_t s_format_result = ESP_FAIL;  // Format の結果（done を渡す前に書く）
 
 void update_free_space() {
     uint64_t total = 0, free_bytes = 0;
@@ -79,11 +87,17 @@ void set_sd_log_level(esp_log_level_t level) {
     for (const char* t : kTags) esp_log_level_set(t, level);
 }
 
-bool try_mount(bool quiet) {
-    esp_vfs_fat_sdmmc_mount_config_t mount_config = {};
-    mount_config.format_if_mount_failed = false;
-    mount_config.max_files = 4;
-    mount_config.allocation_unit_size = 16 * 1024;
+esp_vfs_fat_sdmmc_mount_config_t make_mount_config(bool format) {
+    esp_vfs_fat_sdmmc_mount_config_t c = {};
+    c.format_if_mount_failed = format;  // ふだんは false。利用者のカードを勝手に消さない
+    c.max_files = 4;
+    c.allocation_unit_size = kFormatAllocUnit;
+    return c;
+}
+
+// format: FAT として読めないカードなら、初期化してからマウントする（メニューの「SD カードの初期化」）
+bool try_mount(bool quiet, bool format = false) {
+    esp_vfs_fat_sdmmc_mount_config_t mount_config = make_mount_config(format);
 
     sdmmc_host_t host = SDSPI_HOST_DEFAULT();
     host.slot = kSpiHost;
@@ -119,9 +133,12 @@ bool try_mount(bool quiet) {
         if (!quiet) ESP_LOGW(TAG, "SD mount failed: %s", esp_err_to_name(err));
         s_card = nullptr;
         g_state.sd_mounted.store(false);
+        // カードの初期化までは通り、FAT として読めなかったときは ESP_FAIL（入っていないときはタイムアウトなど）
+        g_state.sd_unreadable.store(err == ESP_FAIL);
         return false;
     }
     g_state.sd_mounted.store(true);
+    g_state.sd_unreadable.store(false);
     if (!quiet) sdmmc_card_print_info(stdout, s_card);
     update_free_space();
     return true;
@@ -134,6 +151,9 @@ void writer_task(void*) {
     uint32_t last_free = 0;
     uint32_t last_card = millis32();
     bool dirty = false;
+    bool fp_wav = false;     // いま開いている録音ファイルが WAV
+    uint32_t fp_bytes = 0;   // いま開いている録音ファイルに書いた量
+    uint32_t kb_rest = 0;    // written_kb に数えていない端数（バイト）
 
     // ログのファイル（SD の LOG フォルダに日付ごと）。録音ファイルとは別に開いておく
     FILE* log_fp = nullptr;
@@ -188,14 +208,22 @@ void writer_task(void*) {
         g_state.sd_free_mb.store(0);
     };
 
-    auto close_fp = [&]() {
-        if (!fp) return;
+    // ここまで書いた分を SD に確定する。WAV なら、頭の長さも今の長さに書き直してから確定する
+    // （電源が切れたり SD を抜かれたりしても、確定したところまでは長さの合ったファイルとして読める）
+    auto sync_fp = [&]() {
         SpiLockGuard lock;
         fflush(fp);
+        if (fp_wav && !wav::patch_sizes(fileno(fp), fp_bytes)) g_state.write_errors.fetch_add(1);
         fsync(fileno(fp));
+        dirty = false;
+    };
+
+    auto close_fp = [&]() {
+        if (!fp) return;
+        sync_fp();
+        SpiLockGuard lock;
         fclose(fp);
         fp = nullptr;
-        dirty = false;
     };
 
     for (;;) {
@@ -207,6 +235,8 @@ void writer_task(void*) {
                     SpiLockGuard lock;
                     mkdir(kRecDir, 0777);
                     fp = fopen(m.path, "wb");
+                    fp_wav = m.wav;
+                    fp_bytes = 0;
                     if (fp) {
                         if (vbuf) setvbuf(fp, vbuf, _IOFBF, 8192);
                         ESP_LOGI(TAG, "open %s", m.path);
@@ -219,17 +249,25 @@ void writer_task(void*) {
                 }
                 case MsgType::Data:
                     if (fp) {
-                        size_t w;
-                        {
-                            SpiLockGuard lock;
-                            w = fwrite(m.data, 1, m.len, fp);
+                        size_t w = 0;
+                        while (w < m.len) {
+                            size_t n = std::min<size_t>(m.len - w, kWriteSliceBytes);
+                            size_t got;
+                            {
+                                SpiLockGuard lock;
+                                got = fwrite(m.data + w, 1, n, fp);
+                            }
+                            w += got;
+                            if (got != n) break;
                         }
+                        fp_bytes += w;
+                        kb_rest += w;
+                        g_state.written_kb.fetch_add(kb_rest / 1024);
+                        kb_rest %= 1024;
+                        if (w) dirty = true;
                         if (w != m.len) {
                             g_state.write_errors.fetch_add(1);
                             last_card = 0;  // 抜かれたかもしれないので、すぐ確かめる
-                        } else {
-                            g_state.bytes_written.fetch_add(m.len);
-                            dirty = true;
                         }
                     }
                     heap_caps_free(m.data);
@@ -266,6 +304,37 @@ void writer_task(void*) {
                     ESP_LOGI(TAG, "shutdown");
                     if (m.done) xSemaphoreGive(m.done);
                     break;
+                case MsgType::Format: {
+                    // 録音していないときだけ呼ばれる。ログのファイルを閉じてから初期化する
+                    close_fp();
+                    close_log();
+                    esp_err_t err;
+                    if (g_state.sd_mounted.load() && s_card) {
+                        esp_vfs_fat_mount_config_t cfg = make_mount_config(false);
+                        {
+                            SpiLockGuard lock;
+                            err = esp_vfs_fat_sdcard_format_cfg(kMountPoint, s_card, &cfg);
+                        }
+                        if (err != ESP_OK) {
+                            // 失敗したら一度外し、ふだんの認識し直しに任せる
+                            // （IDF は付け直しに失敗するとカードを手放すが、登録は残すので、ここで消す）
+                            SpiLockGuard lock;
+                            esp_vfs_fat_sdcard_unmount(kMountPoint, s_card);
+                            s_card = nullptr;
+                            g_state.sd_mounted.store(false);
+                        }
+                    } else {
+                        // FAT として読めないカード（exFAT など）は、マウントできなければ初期化する設定でマウントし直す
+                        err = try_mount(false, true) ? ESP_OK : ESP_FAIL;
+                    }
+                    ESP_LOGI(TAG, "format: %s", esp_err_to_name(err));
+                    if (err == ESP_OK) update_free_space();
+                    last_card = millis32();
+                    last_free = last_card;
+                    s_format_result = err;
+                    if (m.done) xSemaphoreGive(m.done);
+                    break;
+                }
             }
         }
 
@@ -292,10 +361,7 @@ void writer_task(void*) {
 
         // 定期的に fsync して、電源が切れても直前までのファイルが残るようにする
         if (fp && dirty && now - last_sync >= kFsyncIntervalMs) {
-            SpiLockGuard lock;
-            fflush(fp);
-            fsync(fileno(fp));
-            dirty = false;
+            sync_fp();
             last_sync = now;
         }
         if (log_fp && log_dirty && now - last_log_sync >= kFsyncIntervalMs) {
@@ -321,9 +387,10 @@ void start_writer_task() {
     xTaskCreatePinnedToCore(writer_task, "sd_writer", 4096, nullptr, 4, nullptr, 0);
 }
 
-bool open_file(const char* path) {
+bool open_file(const char* path, bool wav) {
     Msg m = {};
     m.type = MsgType::Open;
+    m.wav = wav;
     strlcpy(m.path, path, sizeof(m.path));
     return enqueue(m);
 }
@@ -369,6 +436,22 @@ void flush_log() {
     Msg m = {};
     m.type = MsgType::FlushLog;
     xQueueSend(s_queue, &m, 0);
+}
+
+bool format_card(uint32_t timeout_ms) {
+    SemaphoreHandle_t done = xSemaphoreCreateBinary();
+    if (!done) return false;
+    Msg m = {};
+    m.type = MsgType::Format;
+    m.done = done;
+    if (!s_queue || s_stopped || xQueueSend(s_queue, &m, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        vSemaphoreDelete(done);
+        return false;
+    }
+    // 時間切れのときは、あとで書き込みタスクが done を渡すので、消さずに残す
+    if (xSemaphoreTake(done, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) return false;
+    vSemaphoreDelete(done);
+    return s_format_result == ESP_OK;
 }
 
 bool shutdown(uint32_t timeout_ms) {

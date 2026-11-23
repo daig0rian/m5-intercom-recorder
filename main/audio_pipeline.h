@@ -1,4 +1,4 @@
-// audio タスク: PCM リングバッファ → 20ms フレーム → レベル計測 → Opus → Ogg → SD
+// audio タスク: PCM リングバッファ → 20ms フレーム → レベル計測 → WAV → SD
 #pragma once
 
 #include <cstdint>

@@ -3,4 +3,3 @@ dependencies:
   # 0.3.0 は互換性を崩す変更を含むため 0.2 系に固定
   m5stack/m5unified: "~0.2.29"
   m5stack/m5gfx: "~0.2.36"
-  espressif/esp_audio_codec: "~2.6.2"
