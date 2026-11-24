@@ -80,7 +80,8 @@
 
 ## 開発環境
 
-- ESP-IDF v5.5.6。Windows なら EIM（`winget install Espressif.EIM-CLI`）で入れられる。
+- ESP-IDF v5.5.6。Windows なら EIM（`winget install Espressif.EIM-CLI`）で入れられる。GitHub Actions のビルド（`.github/workflows/build.yml`）も同じ版の Docker イメージ（`espressif/idf:v5.5.6`）を使う。IDF を上げるときは両方を変える。
+- Actions では `sdkconfig` を `sdkconfig.defaults` から作る。`idf.py menuconfig` で変えた設定は、`sdkconfig.defaults` にも書かないとリリースに入らない。
 - 書き込みが「Write timeout」（esptool の Connecting の段階）で止まることがある。USB ケーブルを差し直すと直る。
 
 ## ソースの構成（main/）
@@ -164,7 +165,7 @@
   - 満充電から、録音中（消灯）に 0% の 3.5V で自分で切るまで 2 時間 59 分録れた（WAV）。録音中の電流は、WAV にしても Opus のときと変わらなかった（3.9V 付近で WAV 131mA、Opus 126〜129mA。録音中の電力は 0.47〜0.51W）。
   - 同じ試験で、0% にした 3.5V から 3.3V まで約 4.4 分かかった。3.3V から電源 IC が切る 3.0V までは数十秒。3.3V で自分で切ったときも、録音ファイルを閉じてから止まった。
   - 画面を点けると電流が約 30mA（2 割）増え、電圧は 10mV ほど下がる（内部抵抗 約 0.3Ω）。
-- 起動を終えたときの内部 RAM の空きは約 86KB（ログの「[起動完了]」。Bluetooth Classic と、audio タスクのスタック 12KB を含む）。Opus で録っていたとき（audio タスクのスタック 40KB）は約 48KB だった。
+- 起動を終えたときの内部 RAM の空きは約 84KB（ログの「[起動完了]」。Bluetooth Classic と、audio タスクのスタック 12KB を含む）。Opus で録っていたとき（audio タスクのスタック 40KB）は約 48KB だった。
 - **IRAM（命令用の内部メモリー、約 128KB）はほぼ満杯**（残り約 290 バイト）。中身はほとんど ESP-IDF とライブラリーで、PSRAM のキャッシュ対策のため、標準ライブラリーの文字列・ファイル入出力などの関数も既定で IRAM に置かれる。新しく使い始めた標準関数がそれに当たると IRAM が増える（例: `fputc` は `__swbuf_r` 137 バイトを呼び込んであふれたので `fwrite` にした。WAV の頭の書き直しは、すでに使われている `lseek`・`write` で行い、IRAM は増えなかった）。あふれたらビルドが失敗する。空けるため、数学・乱数・環境変数の関数は IRAM から外している（`sdkconfig.defaults`）。使用量は build/m5-intercom-recorder.map の `_iram_text_end`（上限 0x400A0000）で見る。
 
 ## 次にやること
@@ -181,13 +182,14 @@
 
 ## リリースの手順
 
-1. `ui.cpp` の `kBatteryTestLog` が false であることを確かめる。
-2. タグを付けてからビルドする（アプリのバージョンは git のタグから付く）。`git tag vX.Y.Z`、`idf.py build`、`idf.py merge-bin`。
-3. GitHub のリリースに次を置く（`gh release create vX.Y.Z ...`）。
+1. 依存部品を変えたら、`THIRD_PARTY_LICENSES.txt` を見直す。
+2. タグを付けて push する（`git tag vX.Y.Z`、`git push origin vX.Y.Z`）。アプリのバージョンはタグから付く。
+3. GitHub Actions がビルドして、下書きのリリースを作り、次を置く。`-rc1` などハイフン付きのタグはプレリリースになる。`ui.cpp` の `kBatteryTestLog` が true のときと、アプリのバージョンがタグと違うときは失敗する。
    - `m5-intercom-recorder-vX.Y.Z.bin`：`build/merged-binary.bin`。0x0 に書く。初めて書き込むとき用（設定とペアリングも消える）。
-   - `m5-intercom-recorder-vX.Y.Z-update.bin`：`build/m5-intercom-recorder.bin`。0x10000 に書く。設定とペアリングを残して更新するとき用。パーティション表を変えたリリースでは置かない。
+   - `m5-intercom-recorder-vX.Y.Z-update.bin`：`build/m5-intercom-recorder.bin`。0x10000 に書く。設定とペアリングを残して更新するとき用。前のタグから `partitions.csv` が変わったときと、前のタグがないときは置かない。
    - `THIRD_PARTY_LICENSES.txt`
-4. 依存部品を変えたら、`THIRD_PARTY_LICENSES.txt` を見直す。
+4. 下書きにリリースノートを書いて公開する。
+5. main への push でもビルドし、同じファイルを Actions の実行結果（Artifacts の `firmware`）に置く。リリースの前に実機で試すときに使う。
 
 ## 参考リンク
 

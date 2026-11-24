@@ -1,0 +1,96 @@
+# 書き込み用ファイルのビルドとリリース
+# - main への push・プルリクエスト: ビルドして、書き込み用ファイルを Actions の成果物に置く
+# - v で始まるタグの push: さらに、下書きのリリースを作ってファイルを置く（ハイフン付きのタグはプレリリース）
+name: ビルド
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # 開発に使っている ESP-IDF と同じ版。IDF を上げるときはここも変える
+    container: espressif/idf:v5.5.6
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # アプリのバージョンは git describe（タグ）から付くので、履歴とタグを全部取る
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: リリースの前の確かめ
+        if: github.ref_type == 'tag'
+        shell: bash
+        run: |
+          if ! grep -q 'constexpr bool kBatteryTestLog = false;' main/ui.cpp; then
+            echo "::error::main/ui.cpp の kBatteryTestLog が false ではありません"
+            exit 1
+          fi
+
+      - name: ビルド
+        shell: bash
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          . "$IDF_PATH/export.sh"
+          idf.py build
+          idf.py merge-bin
+
+      - name: 書き込み用ファイルをまとめる
+        shell: bash
+        run: |
+          ver=$(python3 -c 'import json; print(json.load(open("build/project_description.json"))["project_version"])')
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$ver" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::アプリのバージョン（$ver）がタグ（$GITHUB_REF_NAME）と違います"
+            exit 1
+          fi
+          mkdir dist
+          cp build/merged-binary.bin "dist/m5-intercom-recorder-$ver.bin"
+          # 設定とペアリングを残して更新する用。前のタグからパーティション表が変わったときは、
+          # 0x10000 だけ書いても動かないので置かない
+          prev=$(git describe --tags --abbrev=0 --match 'v*' --exclude "$ver" HEAD 2>/dev/null || true)
+          if [ -n "$prev" ] && git diff --quiet "$prev" HEAD -- partitions.csv; then
+            cp build/m5-intercom-recorder.bin "dist/m5-intercom-recorder-$ver-update.bin"
+          else
+            echo "::notice::前のタグ（${prev:-なし}）からパーティション表が変わったか、前のタグが無いので、-update.bin は置きません"
+          fi
+          cp THIRD_PARTY_LICENSES.txt dist/
+          ls -l dist
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: firmware
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: firmware
+          path: dist
+
+      - name: 下書きのリリースを作る
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            # 作り直したときは、ファイルだけ置き換える
+            gh release upload "$TAG" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            opts=(--draft --title "$TAG" --notes-file /dev/null --verify-tag)
+            case "$TAG" in *-*) opts+=(--prerelease) ;; esac
+            gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" "${opts[@]}"
+          fi
