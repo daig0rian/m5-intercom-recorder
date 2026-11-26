@@ -6,6 +6,7 @@
 #include <cstring>
 
 #include "app_state.h"
+#include "bt_diag.h"
 #include "esp_bt.h"
 #include "esp_bt_device.h"
 #include "esp_bt_main.h"
@@ -18,7 +19,6 @@
 
 static const char* TAG = "bt_ag";
 
-extern "C" int bt_diag_role(const uint8_t* bda);  // bt_diag.c
 
 namespace bt_ag {
 namespace {
@@ -910,6 +910,12 @@ bool connect_saved() {
 bool reconnecting() { return s_reconnecting.load(); }
 
 int link_role() { return s_has_peer ? bt_diag_role(s_peer) : -1; }
+
+bool peer_address(uint8_t out[6]) {
+    if (!s_has_peer) return false;
+    memcpy(out, s_peer, 6);
+    return true;
+}
 
 void disconnect() {
     s_disc_requested.store(true);  // 自分で切ったときは、つなぎ直さない

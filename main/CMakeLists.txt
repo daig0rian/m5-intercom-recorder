@@ -28,4 +28,8 @@ target_link_libraries(${COMPONENT_LIB} INTERFACE
     "-Wl,--wrap=btm_sec_set_peer_sec_caps"
     "-u __wrap_btm_sec_set_peer_sec_caps"
     "-Wl,--wrap=btm_acl_role_changed"
-    "-u __wrap_btm_acl_role_changed")
+    "-u __wrap_btm_acl_role_changed"
+    "-Wl,--wrap=esp_vhci_host_send_packet"
+    "-u __wrap_esp_vhci_host_send_packet"
+    "-Wl,--wrap=esp_vhci_host_register_callback"
+    "-u __wrap_esp_vhci_host_register_callback")

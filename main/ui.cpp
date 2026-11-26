@@ -12,6 +12,7 @@
 
 #include "M5Unified.h"
 #include "bt_ag.h"
+#include "bt_diag.h"
 #include "esp_system.h"
 #include "esp_vfs.h"
 #include "rtc_clock.h"
@@ -1786,6 +1787,9 @@ constexpr const char* kHelp[] = {
     "unpair <番号>           ペアリングを削除する",
     "time <YYYY-MM-DD HH:MM:SS>  時刻合わせ（受け取った瞬間をその時刻にする）",
     "note <文>               ログに印を残す（SD のログにも残る）",
+    "hcilog on|off           Bluetooth のホストとコントローラーのやり取り（HCI）を @hci の行で出す（調べるとき用）",
+    "hcicmd <命令> [引数]    HCI のコマンドを直接送る（命令は 4 桁の 16 進。引数は 16 進で、peer は接続先のアドレス、",
+    "                        handle は接続のハンドルに置き換える。例: hcicmd 080b peer 01 で Core2 が子機になる）",
     "format yes              SD カードを初期化する",
     "reset yes               設定を初期化する（再起動する）",
     "poweroff                電源を切る（電源ボタンの長押し）",
@@ -1886,6 +1890,39 @@ const DeviceRow* device_row(const char* index) {
     if (!parse_int(index, &i)) return nullptr;
     build_device_rows();
     return i >= 0 && i < s_row_count ? &s_rows[i] : nullptr;
+}
+
+// hcicmd の引数を読む。16 進の並び（空白は読み飛ばす）。「peer」は接続先のアドレス（HCI の並び = 下の桁から）、
+// 「handle」は接続のハンドル（2 バイト）に置き換える。読めなければ -1
+int parse_hci_params(const char* s, uint8_t* out, int max) {
+    auto hex = [](char c) { return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1; };
+    int n = 0;
+    while (*s) {
+        if (*s == ' ') {
+            s++;
+        } else if (strncmp(s, "peer", 4) == 0 || strncmp(s, "handle", 6) == 0) {
+            bool peer = s[0] == 'p';
+            uint8_t bda[6];
+            if (!bt_ag::peer_address(bda)) return -1;
+            if (peer) {
+                if (n + 6 > max) return -1;
+                for (int i = 0; i < 6; i++) out[n++] = bda[5 - i];
+                s += 4;
+            } else {
+                int h = bt_diag_acl_handle(bda);
+                if (h < 0 || n + 2 > max) return -1;
+                out[n++] = h & 0xFF;
+                out[n++] = h >> 8;
+                s += 6;
+            }
+        } else {
+            int hi = hex(s[0]), lo = s[1] ? hex(s[1]) : -1;
+            if (hi < 0 || lo < 0 || n >= max) return -1;
+            out[n++] = static_cast<uint8_t>(hi << 4 | lo);
+            s += 2;
+        }
+    }
+    return n;
 }
 
 void run_command(char* line) {
@@ -1991,6 +2028,19 @@ void run_command(char* line) {
     } else if (is("note") && *rest) {
         event_log("[印] %s", rest);
         reply_ok(cmd);
+    } else if (is("hcicmd") && w[1]) {
+        uint8_t params[64];
+        char* end;
+        long op = strtol(w[1], &end, 16);
+        const char* args = w[2] ? cmd + (w[2] - line) : "";
+        int plen = *end || op <= 0 || op > 0xFFFF ? -1 : parse_hci_params(args, params, sizeof(params));
+        if (plen < 0) reply_err(cmd, "命令は 4 桁の 16 進、引数は 16 進・peer・handle で");
+        else if (!bt_diag_hci_send(static_cast<uint16_t>(op), params, plen)) reply_err(cmd, "前のコマンドがまだ送れていません");
+        else reply_ok(cmd);
+    } else if (is("hcilog") && parse_on_off(w[1], &on)) {
+        bt_diag_hci_log(on);
+        if (bt_diag_hci_logging() == on) reply_ok(cmd);
+        else reply_err(cmd, "記録の置き場を取れません");
     } else if (is("format") && arg_is("yes")) {
         reply(cmd, format_card());
     } else if (is("reset") && arg_is("yes")) {

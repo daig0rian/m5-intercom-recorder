@@ -46,6 +46,8 @@ void disconnect();
 bool reconnecting();
 // 接続での Core2 の役割（0 = 親機、1 = 子機、-1 = つながっていない）。調べるとき用
 int link_role();
+// 最後に接続した機器のアドレス。なければ false。調べるとき用
+bool peer_address(uint8_t out[6]);
 
 // 診断用: 音声接続だけを開く・閉じる。閉じたら、開く（audio_open か、インカムのボタンで頼まれる）まで、
 // つなぎ直しても自動では開かず、開き直しもしない
