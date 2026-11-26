@@ -16,5 +16,7 @@ void init();  // M5.begin と SD のマウントの後に呼ぶ
 void local_now(struct tm* out);
 // 日本時間で時刻を合わせる（RTC と本体の時計の両方）。曜日は日付から求める
 void set(const struct tm& local);
+// 「2026-11-20 10:30:00」（秒は省ける）を読む。範囲外なら false
+bool parse_datetime(const char* s, struct tm* out);
 
 }  // namespace rtc_clock

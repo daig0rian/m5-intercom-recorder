@@ -55,7 +55,8 @@ struct AppState {
     // SD
     std::atomic<bool> sd_mounted{false};
     std::atomic<bool> sd_unreadable{false};  // カードは応えるが、FAT として読めない（exFAT など）
-    std::atomic<uint32_t> sd_free_mb{0};
+    std::atomic<uint32_t> sd_free_mb{0};  // 空きの見込み（MB）。測った値から、そのあと録音で書いた量を引く
+    std::atomic<bool> sd_full{false};     // 空きが予備（storage::kReserveMb）より少ない。録音を始めない・止める
     std::atomic<uint32_t> written_kb{0};  // 録音ファイルに書いた量（KB）
     std::atomic<uint32_t> write_errors{0};
     std::atomic<uint32_t> write_queue_drops{0};

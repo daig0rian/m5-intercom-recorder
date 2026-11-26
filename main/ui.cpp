@@ -1,6 +1,7 @@
 #include "ui.h"
 
 #include <sys/time.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
@@ -12,6 +13,7 @@
 #include "M5Unified.h"
 #include "bt_ag.h"
 #include "esp_system.h"
+#include "esp_vfs.h"
 #include "rtc_clock.h"
 #include "settings.h"
 #include "sound.h"
@@ -64,6 +66,7 @@ constexpr uint32_t kHoldMs = 1500;          // ピークホールドを保つ時
 constexpr float kHoldFallDbPerSec = 20.0f;  // その後ピークホールドが下がる速さ
 
 enum class Screen { Main, Menu, Devices, Log, Sync, Clock };
+constexpr const char* kScreenNames[] = {"main", "menu", "devices", "log", "sync", "clock"};  // ログとシリアルのコマンド
 
 M5Canvas s_cv(&M5.Display);
 M5Canvas s_vu(&M5.Display);
@@ -183,11 +186,11 @@ const char* link_label() {
     return "";
 }
 
-// SD カードの形（右上の角を落とした四角）。入っていなければ中抜きに斜線
-void sd_icon(int x, int y, bool mounted) {
+// SD カードの形（右上の角を落とした四角）。入っていなければ中抜きに斜線。満杯なら赤
+void sd_icon(int x, int y, bool mounted, bool full) {
     constexpr int w = 14, h = 18, cut = 5;
     if (mounted) {
-        s_cv.fillRect(x, y, w, h, kText);
+        s_cv.fillRect(x, y, w, h, full ? kRed : kText);
         s_cv.fillTriangle(x + w - cut, y, x + w, y, x + w, y + cut, kPanel);
         for (int i = 0; i < 3; i++) s_cv.fillRect(x + 3 + i * 3, y + 2, 2, 4, kPanel);  // 端子
     } else {
@@ -226,15 +229,29 @@ void battery_icon(int x, int y) {
     }
 }
 
-// ヘッダー右側の SD・電池・時刻
+// SD の残りで録れる時間を出すときの色の境目（分）。録音中は、これを切ったときに注意の音で知らせる
+constexpr uint32_t kSdLowMinutes = 60;
+constexpr uint32_t kSdVeryLowMinutes = 15;
+
+// ヘッダー右側の SD（と、残りで録れる時間）・電池・時刻
 void header_icons() {
-    char b[16];
+    char b[24];
     struct tm t;
     rtc_clock::local_now(&t);
     snprintf(b, sizeof(b), "%02d:%02d", t.tm_hour, t.tm_min);
     text(kFont16, kText, kW - 4, 3, b, textdatum_t::top_right);
     battery_icon(kW - 4 - 40 - 6 - 39, 3);
-    sd_icon(kW - 4 - 40 - 6 - 39 - 10 - 14, 2, g_state.sd_mounted.load());
+    constexpr int kSdX = kW - 4 - 40 - 6 - 39 - 10 - 14;
+    bool mounted = g_state.sd_mounted.load();
+    bool full = mounted && g_state.sd_full.load();
+    sd_icon(kSdX, 2, mounted, full);
+    if (mounted && !full) {
+        uint32_t min = storage::minutes_left(g_state.sample_rate.load());
+        if (min >= 60) snprintf(b, sizeof(b), "残り%lu時間", (unsigned long)(min / 60));
+        else snprintf(b, sizeof(b), "残り%lu分", (unsigned long)min);
+        uint16_t color = min < kSdVeryLowMinutes ? kRed : min < kSdLowMinutes ? kOrange : kText;
+        text(kFont12, color, kSdX - 4, 5, b, textdatum_t::top_right);
+    }
 }
 
 // メニューなどの画面の見出し
@@ -281,6 +298,8 @@ void update_meters(uint32_t now) {
 // それでは表示が最後に急に減り、0% になる前に電源 IC が電源を切ることもある。そこで AXP192 では、
 // 録音中（消灯）に電池が切れるまで測った電圧の下がり方から、% が録音できる残り時間に比例するよう表で換算する
 // （消費電力はほぼ一定なので、% は「残りのエネルギー（電圧×電流の積算）」の割合にしている）。
+// 電圧の下がり方は電池ごとに違う（同じ残りでも最大 90mV ほど違った）ので、試したどの電池でも、
+// 表示が実際の残りより多くならないようにする（余裕があると思ったら無かった、を避ける）。
 // 0% は 3.5V とし、電源 IC が自分で切る 3.0V までに数分の余裕を残す（3.3V で切るより、録音できる時間が約 2% 減る）。
 // 電圧は流れる電流で下がる（画面を点けると 10mV ほど）ので、電圧をならしてから換算し、電池で動いている間は
 // 表示を増やさない。
@@ -288,13 +307,15 @@ struct LevelPoint {
     int16_t mv;
     int8_t pct;
 };
-// 電圧の高い順。録音中（消灯、約 120〜140mA）に測った電圧。点の間は直線で結ぶ。
-// 満充電（充電の表示が消えてから）で USB を抜くと約 4.12V から始まり、4.0V より上が全体の 11%。
-// 4.0V より下は、満充電でなかった 2 回を含む 3 回の試験の平均で、3 回の差は 6mV 以内。
+// 電圧の高い順。点の間は直線で結ぶ。録音中（消灯、約 125〜145mA）に、満充電（充電の表示が消えてから）から
+// 0% まで測った 3 本の電池（500mAh の 2 本と、使い込んだ 390mAh）の電圧で、各 % で 3 本のうち最も高い電圧を採る。
+// 満充電で USB を抜くと約 4.12V から始まる。表示が実際の残りより少なく出るのは、500mAh で最大 15 ポイント、
+// 使い込んだ 390mAh で最大 35 ポイント（内部抵抗が大きく、同じ残りでも電圧が低く出るため）。
 // 下の端は電圧が急に下がるので点を細かくする。
 constexpr LevelPoint kAxp192Levels[] = {
-    {4116, 100}, {4088, 99}, {4047, 95}, {4013, 90}, {3926, 80}, {3866, 70}, {3805, 60}, {3756, 50}, {3721, 40},
-    {3699, 30},  {3675, 20}, {3622, 10}, {3604, 5},  {3587, 3},  {3569, 2},  {3545, 1},  {3500, 0},
+    {4116, 100}, {4089, 99}, {4069, 97}, {4058, 95}, {4035, 90}, {4010, 85}, {3989, 80}, {3975, 75}, {3954, 70},
+    {3922, 65},  {3897, 60}, {3862, 55}, {3839, 50}, {3827, 45}, {3812, 40}, {3798, 35}, {3780, 30}, {3766, 25},
+    {3748, 20},  {3719, 15}, {3683, 10}, {3644, 7},  {3631, 5},  {3586, 3},  {3555, 2},  {3520, 1},  {3500, 0},
 };
 // USB を抜いた直後は、充電で上がっていた電圧が数秒で下がる（4.09V → 3.95V を 3 秒）。
 // その高い電圧からならし始めないよう、電池で動き始めてから kFollowMs の間は、ならさずに電圧に従う
@@ -449,6 +470,8 @@ void draw_main() {
         text(kFont16, kAccent, 6, 3, "ループバック中");
     } else if (!g_state.sd_mounted.load()) {
         text(kFont16, kOrange, 6, 3, g_state.sd_unreadable.load() ? "SDカードが読めません" : "SDカードがありません");
+    } else if (g_state.sd_full.load()) {
+        text(kFont16, kRed, 6, 3, "SDカードがいっぱいです");
     } else {
         text(kFont16, kDim, 6, 3, "待機中");
     }
@@ -1106,16 +1129,12 @@ void draw_clock() {
     buttons("", "合わせる", "戻る");
 }
 
-void clock_apply() {
-    if (g_state.rec_requested.load()) return;  // 録音中は開けないが、念のため
+// 時刻を合わせる。録音中は変えられない（ファイル名や区切りの時刻がどうなるか分かりにくくなるため）。
+// 行えなかったときは理由を返す（画面ではトーストに出す。以下の操作も同じ）
+const char* set_clock(const struct tm& local) {
+    if (g_state.rec_requested.load()) return "録音中は時刻を変えられません";
     time_t before = time(nullptr);
-    struct tm t = {};
-    t.tm_year = s_clk[kClkYear] - 1900;
-    t.tm_mon = s_clk[kClkMonth] - 1;
-    t.tm_mday = s_clk[kClkDay];
-    t.tm_hour = s_clk[kClkHour];
-    t.tm_min = s_clk[kClkMinute];
-    t.tm_sec = 0;
+    struct tm t = local;
     t.tm_isdst = 0;
     struct tm tmp = t;
     time_t after = mktime(&tmp);
@@ -1132,8 +1151,23 @@ void clock_apply() {
         localtime_r(&before, &old);
         strftime(was, sizeof(was), "前 %Y-%m-%d %H:%M", &old);
     }
-    event_log("時刻合わせ %04d-%02d-%02d %02d:%02d:00（%s）", s_clk[kClkYear], s_clk[kClkMonth], s_clk[kClkDay],
-              s_clk[kClkHour], s_clk[kClkMinute], was);
+    event_log("時刻合わせ %04d-%02d-%02d %02d:%02d:%02d（%s）", t.tm_year + 1900, t.tm_mon + 1, t.tm_mday, t.tm_hour,
+              t.tm_min, t.tm_sec, was);
+    return nullptr;
+}
+
+// 「合わせる」: 押した瞬間を、選んだ分の 0 秒にする
+void clock_apply() {
+    struct tm t = {};
+    t.tm_year = s_clk[kClkYear] - 1900;
+    t.tm_mon = s_clk[kClkMonth] - 1;
+    t.tm_mday = s_clk[kClkDay];
+    t.tm_hour = s_clk[kClkHour];
+    t.tm_min = s_clk[kClkMinute];
+    if (const char* err = set_clock(t)) {  // 録音中は開けないが、念のため
+        toast(err);
+        return;
+    }
     toast("時刻を合わせました");
     go(Screen::Menu);
 }
@@ -1221,41 +1255,183 @@ void go(Screen s) {
         event_log("映像同期を開始");
         sync_start();
     }
-    static const char* kNames[] = {"main", "menu", "devices", "log", "sync", "clock"};
-    ESP_LOGI("ui", "screen %s", kNames[static_cast<int>(s)]);
+    ESP_LOGI("ui", "screen %s", kScreenNames[static_cast<int>(s)]);
 }
 
-void toggle_rec() {
-    if (g_state.rec_requested.load()) {
-        g_state.rec_requested.store(false);
-        sound::play(sound::Cue::RecStop);
-        return;
+// ---- SD の空き ----------------------------------------------------------------
+// 満杯の手前になったら録音を止めて知らせる。録音中に残りが 1 時間・15 分を切ったら知らせる
+
+bool s_sd_full_prev = false;
+int s_sd_warned = 0;  // 録音中に知らせた段階（0 = まだ、1 = 1 時間、2 = 15 分）
+
+int sd_low_stage(uint32_t min) { return min < kSdVeryLowMinutes ? 2 : min < kSdLowMinutes ? 1 : 0; }
+
+// 定期的に呼ぶ。消していた画面をつけたほうがよいとき（満杯で止めた・満杯のカードが挿さった）は true
+bool check_sd_space() {
+    bool full = g_state.sd_mounted.load() && g_state.sd_full.load();
+    bool became_full = full && !s_sd_full_prev;
+    s_sd_full_prev = full;
+    if (became_full) {
+        if (g_state.rec_requested.load()) {
+            g_state.rec_requested.store(false);
+            event_log("SDカードがいっぱいなので録音を止めました");
+            sound::play(sound::Cue::RecStop);
+        }
+        // ログは 1 行 96 バイトまで・画面の幅に収まるよう、2 行に分ける
+        event_log("SDカードがいっぱいです（空き %luMB）", (unsigned long)g_state.sd_free_mb.load());
+        event_log("古い録音を PC で消すか、初期化してください");
+        sound::play(sound::Cue::Warning);
+        toast("SDカードがいっぱいです");
+        return true;
     }
+    if (full || !g_state.sd_mounted.load() || !g_state.rec_requested.load()) return false;
+
+    uint32_t min = storage::minutes_left(g_state.sample_rate.load());
+    int stage = sd_low_stage(min);
+    if (stage > s_sd_warned) {
+        event_log("SDカードの残りが %lu 分を切りました", (unsigned long)(stage == 2 ? kSdVeryLowMinutes : kSdLowMinutes));
+        sound::play(sound::Cue::Warning);
+        s_sd_warned = stage;
+    } else if (stage < s_sd_warned) {
+        // カードの空きを測り直して増えたとき。境目の前後で何度も鳴らないよう、5 分の余裕をもって戻す
+        uint32_t border = s_sd_warned == 2 ? kSdVeryLowMinutes : kSdLowMinutes;
+        if (min >= border + 5) s_sd_warned = stage;
+    }
+    return false;
+}
+
+// ---- 操作の中身 ----------------------------------------------------------------
+// 画面のボタンとシリアルのコマンドの両方から呼ぶ。行えなかったときは理由を返す（画面ではトーストに出す）
+
+void show(const char* err) {
+    if (err) toast(err);
+}
+
+void stop_rec() {
+    if (!g_state.rec_requested.load()) return;
+    g_state.rec_requested.store(false);
+    sound::play(sound::Cue::RecStop);
+}
+
+const char* start_rec() {
+    if (g_state.rec_requested.load()) return nullptr;
     if (!g_state.sd_mounted.load()) {
-        toast(g_state.sd_unreadable.load() ? "SD カードが読めません" : "SD カードがありません");
-        return;
+        return g_state.sd_unreadable.load() ? "SD カードが読めません" : "SD カードがありません";
+    }
+    if (g_state.sd_full.load()) {
+        sound::play(sound::Cue::Warning);
+        return "SDカードがいっぱいです";
     }
     // ループバックの声が通話相手に聞こえたり録音に混ざったりしないよう、録音中は止める
     bt_ag::set_loopback(false);
     g_state.rec_started_ms.store(millis32());
     g_state.rec_requested.store(true);
     sound::play(sound::Cue::RecStart);
+    // 始めたときに残りが少なければ、いまの残りを出す（その段階の注意の音は、もう鳴らさない）
+    uint32_t min = storage::minutes_left(g_state.sample_rate.load());
+    s_sd_warned = sd_low_stage(min);
+    if (s_sd_warned > 0) {
+        char b[48];
+        snprintf(b, sizeof(b), "SDカードの残りは約 %lu 分です", (unsigned long)min);
+        toast(b);
+    }
+    return nullptr;
+}
+
+constexpr const char* kNoPeer = "接続先がありません（機器を探してください）";
+
+// 最後に接続した機器につなぐ
+const char* bt_connect() {
+    BtState st = g_state.bt_state.load();
+    if (bt_ag::reconnecting()) return "つなぎ直し中です";
+    if (st == BtState::Discovering) return "機器を検索中です";
+    if (st == BtState::Idle && !bt_ag::connect_saved()) return kNoPeer;
+    return nullptr;  // つながっている・つなぎに行っているときは何もしない
+}
+
+// 切る。録音中のつなぎ直しもやめる
+void bt_disconnect() {
+    if (bt_ag::reconnecting() || g_state.bt_state.load() >= BtState::Connecting) bt_ag::disconnect();
+}
+
+const char* set_audio(bool on) {
+    if (g_state.bt_state.load() < BtState::Connected) return "インカムに接続してください";
+    if (on) bt_ag::audio_open();
+    else bt_ag::audio_close();
+    return nullptr;
+}
+
+const char* set_loopback(bool on) {
+    if (!on) {
+        bt_ag::set_loopback(false);
+        return nullptr;
+    }
+    if (g_state.bt_state.load() != BtState::AudioOn) return "音声接続中に使えます";
+    if (g_state.rec_requested.load()) return "録音中はループバックできません";
+    bt_ag::set_loopback(true);
+    return nullptr;
+}
+
+const char* set_mic_gain(int gain) {
+    if (g_state.bt_state.load() < BtState::Connected) return "インカムに接続してください";
+    if (!g_state.hf_remote_volume.load()) return "非対応機器です";
+    bt_ag::set_mic_gain(gain);
+    return nullptr;
+}
+
+// 録音中は変えられない（いまのファイルや次の区切りがどうなるか分かりにくくなるため）
+const char* set_split(uint32_t sec) {
+    if (g_state.rec_requested.load()) return "録音中は変えられません";
+    for (const SplitOption& o : kSplitOptions) {
+        if (o.sec != sec) continue;
+        g_state.split_ms.store(sec * 1000);
+        settings::set_split_sec(sec);
+        return nullptr;
+    }
+    return "その長さは選べません";
+}
+
+void set_log_to_sd(bool on) {
+    g_state.log_to_sd.store(on);
+    settings::set_log_to_sd(on);
+}
+
+void set_reconnect_on_boot(bool on) {
+    g_state.reconnect_on_boot.store(on);
+    settings::set_reconnect_on_boot(on);
+}
+
+void set_brightness(int level) {
+    s_brightness = std::clamp(level, 0, 2);
+    M5.Display.setBrightness(kBrightness[s_brightness]);
+}
+
+// 機器の一覧の行を選んだとき。結果をトーストの文言で返し、メイン画面へ戻るなら *done を立てる
+const char* select_device(const DeviceRow& r, bool* done) {
+    *done = false;
+    if (!r.paired) {
+        bt_ag::connect_to(r.bda, r.name);  // まだペアリングしていない機器: ペアリングする
+        *done = true;
+        return "ペアリングしています…";
+    }
+    if (r.connected) return "接続中です";
+    bool busy = g_state.bt_state.load() >= BtState::Connecting;
+    bt_ag::connect_paired(r.bda, r.name);  // 別の機器につながっていれば、まず切る
+    if (busy) return "切断しました。もう一度押すと接続します";
+    *done = true;
+    return "接続しています…";
 }
 
 void on_main(int btn, int, int) {
     if (btn == 0) {
         BtState st = g_state.bt_state.load();
-        if (bt_ag::reconnecting()) {
-            bt_ag::disconnect();  // つなぎ直しをやめる
-        } else if (st == BtState::Idle) {
-            if (!bt_ag::connect_saved()) go(Screen::Devices);
-        } else if (st >= BtState::Connecting) {
-            bt_ag::disconnect();
-        }
+        if (bt_ag::reconnecting() || st >= BtState::Connecting) bt_disconnect();
+        else if (st == BtState::Idle && bt_connect() == kNoPeer) go(Screen::Devices);
     } else if (btn == 1) {
         go(Screen::Menu);
     } else if (btn == 2) {
-        toggle_rec();
+        if (g_state.rec_requested.load()) stop_rec();
+        else show(start_rec());
     }
 }
 
@@ -1277,6 +1453,14 @@ void format_sd() {
     toast(ok ? "SD カードを初期化しました" : "初期化できませんでした");
 }
 
+// 録音中と、カードが入っていないときは使えない
+const char* format_card() {
+    if (g_state.rec_requested.load()) return "録音中は初期化できません";
+    if (!sd_card_present()) return "SD カードを入れてください";
+    format_sd();
+    return nullptr;
+}
+
 void on_menu(int btn, int x, int y) {
     if (btn == 2) {
         go(Screen::Main);
@@ -1292,15 +1476,10 @@ void on_menu(int btn, int x, int y) {
             go(Screen::Devices);
             break;
         case kRowAudio:
-            if (st < BtState::Connected) toast("インカムに接続してください");
-            else if (st == BtState::AudioOn) bt_ag::audio_close();
-            else bt_ag::audio_open();
+            show(set_audio(st != BtState::AudioOn));
             break;
         case kRowLoopback:
-            if (g_state.loopback.load()) bt_ag::set_loopback(false);
-            else if (st != BtState::AudioOn) toast("音声接続中に使えます");
-            else if (g_state.rec_requested.load()) toast("録音中はループバックできません");
-            else bt_ag::set_loopback(true);
+            show(set_loopback(!g_state.loopback.load()));
             break;
         case kRowSync:
             go(Screen::Sync);
@@ -1322,35 +1501,24 @@ void on_menu(int btn, int x, int y) {
             if (step == 0) break;
             int gain = g_state.hf_mic_gain.load();
             if (gain < 0) gain = settings::get_mic_gain() >= 0 ? settings::get_mic_gain() : 8;
-            bt_ag::set_mic_gain(gain + step);
+            show(set_mic_gain(gain + step));
             break;
         }
-        case kRowSplit: {
+        case kRowSplit:
             if (g_state.rec_requested.load()) break;  // 録音中は変えられない（行に「録音中変更不可」と出している）
-            // 押すたびに次の長さへ
-            const SplitOption& next = kSplitOptions[(split_index() + 1) % kSplitCount];
-            g_state.split_ms.store(next.sec * 1000);
-            settings::set_split_sec(next.sec);
+            show(set_split(kSplitOptions[(split_index() + 1) % kSplitCount].sec));  // 押すたびに次の長さへ
             break;
-        }
         case kRowLogView:
             go(Screen::Log);
             break;
-        case kRowLogSd: {
-            bool on = !g_state.log_to_sd.load();
-            g_state.log_to_sd.store(on);
-            settings::set_log_to_sd(on);
+        case kRowLogSd:
+            set_log_to_sd(!g_state.log_to_sd.load());
             break;
-        }
-        case kRowReconnect: {
-            bool on = !g_state.reconnect_on_boot.load();
-            g_state.reconnect_on_boot.store(on);
-            settings::set_reconnect_on_boot(on);
+        case kRowReconnect:
+            set_reconnect_on_boot(!g_state.reconnect_on_boot.load());
             break;
-        }
         case kRowBrightness:
-            s_brightness = (s_brightness + 1) % 3;
-            M5.Display.setBrightness(kBrightness[s_brightness]);
+            set_brightness((s_brightness + 1) % 3);
             break;
         case kRowSdFormat:
             if (g_state.rec_requested.load()) break;  // 録音中は使えない（行に「録音中変更不可」と出している）
@@ -1360,7 +1528,7 @@ void on_menu(int btn, int x, int y) {
             }
             if (format_armed() && x >= kResetBtnX - 6) {
                 s_format_armed_until = 0;
-                format_sd();
+                show(format_card());
             } else {
                 s_format_armed_until = millis32() + kResetConfirmMs;
             }
@@ -1409,14 +1577,7 @@ void on_devices(int btn, int x, int y) {
     if (row >= s_row_count) return;
     const DeviceRow& r = s_rows[row];
 
-    if (!r.paired) {
-        // まだペアリングしていない機器: 行のどこを押してもペアリングする
-        bt_ag::connect_to(r.bda, r.name);
-        toast("ペアリングしています…");
-        go(Screen::Main);
-        return;
-    }
-    if (x >= kDevBtnX) {
+    if (r.paired && x >= kDevBtnX) {
         // 「削除」: 押し間違いを防ぐため、もう一度押したら消す
         if (delete_armed(r.bda)) {
             bt_ag::remove_pairing(r.bda);
@@ -1427,19 +1588,10 @@ void on_devices(int btn, int x, int y) {
         }
         return;
     }
-    // ペアリング済みの機器の行: その機器につなぐ
-    if (r.connected) {
-        toast("接続中です");
-        return;
-    }
-    if (g_state.bt_state.load() >= BtState::Connecting) {
-        bt_ag::connect_paired(r.bda, r.name);  // 別の機器につながっていれば、まず切る
-        toast("切断しました。もう一度押すと接続します");
-        return;
-    }
-    bt_ag::connect_paired(r.bda, r.name);
-    toast("接続しています…");
-    go(Screen::Main);
+    // まだペアリングしていない機器は、行のどこを押してもペアリングする。ペアリング済みの機器は、その機器につなぐ
+    bool done;
+    toast(select_device(r, &done));
+    if (done) go(Screen::Main);
 }
 
 // 入力があれば true
@@ -1498,7 +1650,7 @@ void graceful_shutdown(const char* message, bool factory_reset) {
     if (!s_screen_on) set_screen(true);
     // 録音中なら、まずふだんの「停止」と同じ流れで止める（ボタンが「録音」に戻り、ドソが鳴る）
     if (g_state.rec_requested.load()) {
-        toggle_rec();
+        stop_rec();
         render_full();
         wait_until([] { return !g_state.recording.load(); }, 1500);  // ファイルを閉じるまで
         wait_until([] { return !sound::busy(); }, 500);                // ドソが鳴り終わるまで
@@ -1530,6 +1682,18 @@ void graceful_shutdown(const char* message, bool factory_reset) {
         esp_restart();
     }
     M5.Power.powerOff();
+}
+
+// いまの画面で押す。btn: 下の 3 つのボタン（0〜2。-1 = 画面の中を押した）。x, y: 押した位置
+void press(int btn, int x, int y) {
+    switch (s_screen) {
+        case Screen::Main: on_main(btn, x, y); break;
+        case Screen::Menu: on_menu(btn, x, y); break;
+        case Screen::Devices: on_devices(btn, x, y); break;
+        case Screen::Log: on_log(btn, x, y); break;
+        case Screen::Sync: on_sync(btn, x, y); break;
+        case Screen::Clock: on_clock(btn, x, y); break;
+    }
 }
 
 bool handle_input() {
@@ -1589,15 +1753,292 @@ bool handle_input() {
         // 画面下端に描いたボタンの文字を押した場合も、同じボタンとして扱う
         if (y >= kBtnY) btn = std::clamp(x / 107, 0, 2);
     }
-    switch (s_screen) {
-        case Screen::Main: on_main(btn, x, y); break;
-        case Screen::Menu: on_menu(btn, x, y); break;
-        case Screen::Devices: on_devices(btn, x, y); break;
-        case Screen::Log: on_log(btn, x, y); break;
-        case Screen::Sync: on_sync(btn, x, y); break;
-        case Screen::Clock: on_clock(btn, x, y); break;
-    }
+    press(btn, x, y);
     return true;
+}
+
+// ---- シリアルからの操作 ----------------------------------------------------------
+// 試験を自動で進めるため、画面の操作と同じことを USB のシリアルから 1 行のコマンドで行う（help で一覧）。
+// 返事は「@」で始まる行にして、ログの行と見分けられるようにする。コマンドごとに最後に 1 行、
+// 「@ok <コマンド>」か「@err <コマンド>: <理由>」を返す（その前に、結果の行が付くことがある）。
+// ドライバーを入れず、UI タスクから標準入力を待たずに読む。受信の FIFO は 128 バイトなので、
+// 1 行ずつ送って返事を待てばあふれない（消灯中に読む間隔の 50ms で、115200bps なら約 580 バイト届く）。
+
+constexpr const char* kBtNames[] = {"off", "idle", "discovering", "connecting", "connected", "audio"};
+
+constexpr const char* kHelp[] = {
+    "status                  状態を 1 行で返す",
+    "rec on|off              録音を始める・止める（メイン画面の「録音」「停止」）",
+    "bt connect|disconnect   最後に接続した機器につなぐ・切る（メイン画面の左のボタン）",
+    "audio on|off            音声接続（メニュー。以下も同じ）",
+    "loopback on|off         ループバックモニター",
+    "gain <0-15>             マイク感度",
+    "split <秒>              ファイル分割（0 30 60 300 900 1800 3600。0 = 分割なし）",
+    "logsd on|off            ログを SD に保存",
+    "autoconnect on|off      起動時に再接続",
+    "bright <0-2>            画面の明るさ（0 = 高）",
+    "display on|off          画面を点ける・消す（電源ボタンの短押し）",
+    "go <画面>               画面を移る（main menu devices log sync clock。devices で検索も始める）",
+    "btn a|b|c               画面の下の左・真ん中・右のボタン（画面が点いているときだけ）",
+    "tap <x> <y>             画面を押す（320×240。画面が点いているときだけ）",
+    "devices                 機器の画面の行の一覧（番号は上からの順）",
+    "select <番号>           機器の行を押す（ペアリング・接続）",
+    "unpair <番号>           ペアリングを削除する",
+    "time <YYYY-MM-DD HH:MM:SS>  時刻合わせ（受け取った瞬間をその時刻にする）",
+    "note <文>               ログに印を残す（SD のログにも残る）",
+    "format yes              SD カードを初期化する",
+    "reset yes               設定を初期化する（再起動する）",
+    "poweroff                電源を切る（電源ボタンの長押し）",
+};
+
+void reply_ok(const char* cmd, const char* note = nullptr) {
+    if (note) printf("@ok %s — %s\n", cmd, note);
+    else printf("@ok %s\n", cmd);
+    fflush(stdout);
+}
+
+void reply_err(const char* cmd, const char* why) {
+    printf("@err %s: %s\n", cmd, why);
+    fflush(stdout);
+}
+
+void reply(const char* cmd, const char* err) {
+    if (err) reply_err(cmd, err);
+    else reply_ok(cmd);
+}
+
+void print_status() {
+    char peer[40], file[48], now[24], drop[12];
+    state_get_peer_name(peer, sizeof(peer));
+    state_get_file_name(file, sizeof(file));
+    struct tm t;
+    rtc_clock::local_now(&t);
+    strftime(now, sizeof(now), "%Y-%m-%dT%H:%M:%S", &t);
+    int d = g_state.pkt_drop_x10.load();
+    if (d >= 0) snprintf(drop, sizeof(drop), "%d.%d", d / 10, d % 10);
+    else strlcpy(drop, "-", sizeof(drop));
+    Codec codec = g_state.codec.load();
+    const char* sd = !g_state.sd_mounted.load() ? (g_state.sd_unreadable.load() ? "unreadable" : "none")
+                     : g_state.sd_full.load()   ? "full"
+                                                : "ok";
+    int role = bt_ag::link_role();
+    printf("@status time=%s uptime_s=%lu screen=%s display=%s bt=%s role=%s reconnecting=%d peer=\"%s\" codec=%s "
+           "audio_wanted=%d loopback=%d drop=%s rec=%d recording=%d file=\"%s\" rec_s=%lu overflows=%lu sd=%s "
+           "free_mb=%lu left_min=%lu write_err=%lu battery=%d charging=%d usb=%d gain=%d split=%lu logsd=%d "
+           "autoconnect=%d\n",
+           now, (unsigned long)(millis32() / 1000), kScreenNames[static_cast<int>(s_screen)], s_screen_on ? "on" : "off",
+           kBtNames[static_cast<int>(g_state.bt_state.load())], role == 0 ? "central" : role == 1 ? "peripheral" : "-",
+           bt_ag::reconnecting(), peer,
+           codec == Codec::Msbc ? "msbc" : codec == Codec::Cvsd ? "cvsd" : "none", bt_ag::audio_wanted(),
+           g_state.loopback.load(), drop, g_state.rec_requested.load(), g_state.recording.load(), file,
+           (unsigned long)(g_state.rec_audio_ms.load() / 1000), (unsigned long)g_state.ring_overflows.load(), sd,
+           (unsigned long)g_state.sd_free_mb.load(), (unsigned long)storage::minutes_left(g_state.sample_rate.load()),
+           (unsigned long)(g_state.write_errors.load() + g_state.write_queue_drops.load()), s_battery, s_charging,
+           usb_power(), g_state.hf_mic_gain.load(), (unsigned long)(g_state.split_ms.load() / 1000),
+           g_state.log_to_sd.load(), g_state.reconnect_on_boot.load());
+}
+
+void print_devices() {
+    build_device_rows();
+    for (int i = 0; i < s_row_count; i++) {
+        const DeviceRow& r = s_rows[i];
+        if (r.paired) {
+            printf("@dev %d paired \"%s\"%s\n", i, r.name, !r.last ? "" : r.connected ? " connected" : " last");
+        } else {
+            printf("@dev %d found \"%s\" rssi=%d%s\n", i, r.name, r.rssi, r.is_audio ? " audio" : "");
+        }
+    }
+}
+
+bool parse_on_off(const char* s, bool* on) {
+    if (!s) return false;
+    if (strcmp(s, "on") == 0) *on = true;
+    else if (strcmp(s, "off") == 0) *on = false;
+    else return false;
+    return true;
+}
+
+bool parse_int(const char* s, int* out) {
+    if (!s || !*s) return false;
+    char* end;
+    long v = strtol(s, &end, 10);
+    if (*end) return false;
+    *out = static_cast<int>(v);
+    return true;
+}
+
+// 空白で区切る（区切りを '\0' に書き換える）。最大 max 個
+int split_words(char* s, char* words[], int max) {
+    int n = 0;
+    while (n < max) {
+        while (*s == ' ' || *s == '\t') s++;
+        if (!*s) break;
+        words[n++] = s;
+        while (*s && *s != ' ' && *s != '\t') s++;
+        if (*s) *s++ = '\0';
+    }
+    return n;
+}
+
+// 機器の画面の行の番号から、その行を取る（一覧は、そのときの検索の結果から作り直す）
+const DeviceRow* device_row(const char* index) {
+    int i;
+    if (!parse_int(index, &i)) return nullptr;
+    build_device_rows();
+    return i >= 0 && i < s_row_count ? &s_rows[i] : nullptr;
+}
+
+void run_command(char* line) {
+    char cmd[128];
+    strlcpy(cmd, line, sizeof(cmd));  // 返事に付ける（line は区切って使う）
+    char* w[4] = {};
+    int n = split_words(line, w, 4);
+    if (n == 0) return;
+    auto is = [&](const char* name) { return strcmp(w[0], name) == 0; };
+    auto arg_is = [&](const char* s) { return w[1] && strcmp(w[1], s) == 0; };
+    // 1 つ目の引数から行の終わりまで（note・time）
+    const char* rest = w[1] ? cmd + (w[1] - line) : "";
+    bool on;
+    int v, x, y;
+
+    if (is("help")) {
+        for (const char* h : kHelp) printf("@help %s\n", h);
+        reply_ok(cmd);
+    } else if (is("status")) {
+        print_status();
+        reply_ok(cmd);
+    } else if (is("rec") && parse_on_off(w[1], &on)) {
+        if (on) {
+            reply(cmd, start_rec());
+        } else {
+            stop_rec();
+            reply_ok(cmd);
+        }
+    } else if (is("bt") && arg_is("connect")) {
+        reply(cmd, bt_connect());
+    } else if (is("bt") && arg_is("disconnect")) {
+        bt_disconnect();
+        reply_ok(cmd);
+    } else if (is("audio") && parse_on_off(w[1], &on)) {
+        reply(cmd, set_audio(on));
+    } else if (is("loopback") && parse_on_off(w[1], &on)) {
+        reply(cmd, set_loopback(on));
+    } else if (is("gain") && parse_int(w[1], &v) && v >= 0 && v <= 15) {
+        reply(cmd, set_mic_gain(v));
+    } else if (is("split") && parse_int(w[1], &v) && v >= 0) {
+        reply(cmd, set_split(v));
+    } else if (is("logsd") && parse_on_off(w[1], &on)) {
+        set_log_to_sd(on);
+        reply_ok(cmd);
+    } else if (is("autoconnect") && parse_on_off(w[1], &on)) {
+        set_reconnect_on_boot(on);
+        reply_ok(cmd);
+    } else if (is("bright") && parse_int(w[1], &v) && v >= 0 && v <= 2) {
+        set_brightness(v);
+        reply_ok(cmd);
+    } else if (is("display") && parse_on_off(w[1], &on)) {
+        if (on != s_screen_on) set_screen(on);
+        reply_ok(cmd);
+    } else if (is("go") && w[1]) {
+        int s = -1;
+        for (int i = 0; i < static_cast<int>(sizeof(kScreenNames) / sizeof(kScreenNames[0])); i++) {
+            if (strcmp(w[1], kScreenNames[i]) == 0) s = i;
+        }
+        if (s < 0) {
+            reply_err(cmd, "その画面はありません");
+        } else if (static_cast<Screen>(s) == Screen::Clock && g_state.rec_requested.load()) {
+            reply_err(cmd, "録音中は時刻を変えられません");  // メニューの「時刻合わせ」も、録音中は押せない
+        } else {
+            if (static_cast<Screen>(s) == Screen::Clock) clock_open();
+            go(static_cast<Screen>(s));
+            reply_ok(cmd);
+        }
+    } else if ((is("btn") && w[1] && w[1][0] >= 'a' && w[1][0] <= 'c' && !w[1][1]) ||
+               (is("tap") && parse_int(w[1], &x) && parse_int(w[2], &y) && x >= 0 && x < kW && y >= 0 && y < kH)) {
+        if (!s_screen_on) {
+            reply_err(cmd, "画面が消えています（display on で点けてください）");  // 消灯中は画面の操作を受け付けない
+        } else if (is("btn")) {
+            press(w[1][0] - 'a', -1, -1);
+            reply_ok(cmd);
+        } else {
+            press(y >= kBtnY ? std::clamp(x / 107, 0, 2) : -1, x, y);
+            reply_ok(cmd);
+        }
+    } else if (is("devices")) {
+        print_devices();
+        reply_ok(cmd);
+    } else if (is("select")) {
+        const DeviceRow* r = device_row(w[1]);
+        if (!r) {
+            reply_err(cmd, "その番号の機器はありません（devices で一覧）");
+        } else {
+            bool done;
+            reply_ok(cmd, select_device(*r, &done));
+            if (done && s_screen == Screen::Devices) go(Screen::Main);  // 画面で押したときと同じく、メイン画面へ
+        }
+    } else if (is("unpair")) {
+        const DeviceRow* r = device_row(w[1]);
+        if (!r || !r->paired) {
+            reply_err(cmd, "その番号のペアリング済みの機器はありません（devices で一覧）");
+        } else {
+            bt_ag::remove_pairing(r->bda);
+            reply_ok(cmd);
+        }
+    } else if (is("time")) {
+        struct tm t;
+        if (!rtc_clock::parse_datetime(rest, &t)) reply_err(cmd, "日時は YYYY-MM-DD HH:MM:SS で");
+        else reply(cmd, set_clock(t));
+    } else if (is("note") && *rest) {
+        event_log("[印] %s", rest);
+        reply_ok(cmd);
+    } else if (is("format") && arg_is("yes")) {
+        reply(cmd, format_card());
+    } else if (is("reset") && arg_is("yes")) {
+        if (g_state.rec_requested.load()) {
+            reply_err(cmd, "録音中は初期化できません");
+        } else {
+            reply_ok(cmd);
+            graceful_shutdown("設定を初期化しています…", true);  // 戻ってこない（再起動する）
+        }
+    } else if (is("poweroff")) {
+        reply_ok(cmd);
+        graceful_shutdown();  // 戻ってこない
+    } else {
+        reply_err(cmd, "分からないコマンドです（help で一覧）");
+    }
+}
+
+char s_line[128];
+size_t s_line_len = 0;
+bool s_line_long = false;  // 長すぎる行（行の終わりまで捨てる）
+
+// 届いた分を読み、行がそろったら行う。行ったら true
+bool poll_serial() {
+    bool ran = false;
+    char buf[32];
+    ssize_t n;
+    // read() は IRAM に置かれる関数で、IRAM はほぼ満杯なので、VFS の関数を直接呼ぶ
+    while ((n = esp_vfs_read(__getreent(), STDIN_FILENO, buf, sizeof(buf))) > 0) {
+        for (ssize_t i = 0; i < n; i++) {
+            char c = buf[i];
+            if (c == '\n') {  // CR も LF に変わって届く（CONFIG_NEWLIB_STDIN_LINE_ENDING_CR）
+                s_line[s_line_len] = '\0';
+                if (s_line_long) {
+                    reply_err("(長すぎる行)", "1 行は 127 バイトまで");
+                } else if (s_line_len > 0) {
+                    run_command(s_line);
+                    ran = true;
+                }
+                s_line_len = 0;
+                s_line_long = false;
+            } else if (s_line_len + 1 < sizeof(s_line)) {
+                s_line[s_line_len++] = c;
+            } else {
+                s_line_long = true;
+            }
+        }
+    }
+    return ran;
 }
 
 // 消灯中に電源ボタンを確かめる間隔。電源 IC が押されたことを覚えているので、押し逃さない
@@ -1612,22 +2053,26 @@ void ui_task(void*) {
     uint32_t last_power_off = 0;
     for (;;) {
         if (!s_screen_on) {
+            poll_serial();
+            if (s_screen_on) continue;  // display on で点けた
             uint32_t t = millis32();
+            bool wake = false;
             if (t - last_power_off >= kScreenOffPowerMs) {
                 read_power();
                 last_power_off = t;
                 if (s_battery_empty) graceful_shutdown(kBatteryEmptyMessage);
+                wake = check_sd_space();  // 満杯で録音を止めたら、画面をつけて知らせる
             }
             // 消灯中はタッチ（3 つのボタンを含む）を読まず、電源ボタンだけを電源 IC に問い合わせる（電池は上で 2 秒ごと）
             // （getKeyState: 0 = なし、2 = 短押し、それ以外 = 長押し）
             uint8_t key = M5.Power.getKeyState();
-            if (key == 2) {
+            if (key != 0 && key != 2) {
+                graceful_shutdown();
+            } else if (key == 2 || wake) {
                 set_screen(true);
                 M5.update();  // 消灯中にたまったタッチの状態を読み捨てる
                 render_full();
                 last_full = millis32();
-            } else if (key != 0) {
-                graceful_shutdown();
             }
             vTaskDelay(pdMS_TO_TICKS(kScreenOffPollMs));
             continue;
@@ -1635,9 +2080,11 @@ void ui_task(void*) {
 
         M5.update();
         bool input = handle_input();
+        if (poll_serial()) input = true;
         uint32_t now = millis32();
         update_stats(now);
         if (s_battery_empty) graceful_shutdown(kBatteryEmptyMessage);
+        if (check_sd_space()) input = true;  // すぐ描き直す
 
         uint32_t vu_interval = g_state.recording.load() ? kVuIntervalRecMs : kVuIntervalIdleMs;
         bool vu_due = now - last_vu >= vu_interval;

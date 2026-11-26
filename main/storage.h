@@ -11,6 +11,13 @@ constexpr const char* kMountPoint = "/sdcard";
 constexpr const char* kRecDir = "/sdcard/REC";
 constexpr const char* kLogDir = "/sdcard/LOG";
 
+// 満杯になる手前で録音を止めるために残しておく空き（MB）。16kHz で約 4 分。
+// 空きを測る間（30 秒）に書く量と、書き込みの列にたまる量（最大 2MB）より大きくし、止めたというログも書けるようにする
+constexpr uint32_t kReserveMb = 8;
+
+// SD の空き（予備を除く）で録れる分数。sample_rate が 0（音声なし）なら 16kHz として数える
+uint32_t minutes_left(uint32_t sample_rate);
+
 bool mount();
 void start_writer_task();
 

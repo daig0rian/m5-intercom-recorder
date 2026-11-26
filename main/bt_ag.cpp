@@ -18,6 +18,8 @@
 
 static const char* TAG = "bt_ag";
 
+extern "C" int bt_diag_role(const uint8_t* bda);  // bt_diag.c
+
 namespace bt_ag {
 namespace {
 
@@ -72,6 +74,9 @@ constexpr int kTxProbeTicks = 200;  // やめている間も 1 秒に 1 回だ�
 std::atomic<uint32_t> s_audio_req_ms{0};
 constexpr uint32_t kAudioReqTimeoutMs = 3000;
 void mark_audio_request() { s_audio_req_ms.store(millis32() | 1); }
+
+// 音声接続を開いておきたいか。メニューで閉じたら false にし、開くまで自動では開かない・開き直さない
+std::atomic<bool> s_audio_wanted{true};
 
 // 音声接続の開き直し（audio_reopen）。閉じたら開く。開けなければ、開けるか SLC が切れるまで試し続ける
 std::atomic<bool> s_reopening{false};
@@ -305,6 +310,10 @@ void auto_audio_cb(void*) {
         event_log("マイク感度を %d に設定", saved);
     }
     if (!s_audio_on.load() && g_state.bt_state.load() == BtState::Connected) {
+        if (!s_audio_wanted.load()) {
+            event_log("音声接続はオフのままにします");
+            return;
+        }
         event_log("音声接続を開きます");
         mark_audio_request();
         esp_hf_ag_audio_connect(s_peer);
@@ -452,6 +461,7 @@ void hf_cb(esp_hf_cb_event_t event, esp_hf_cb_param_t* p) {
             // ヘッドセットのボタンで音声認識を求められた → 音声接続を開いて応える
             event_log("AT+BVRA=%d", p->vra_rep.value);
             if (p->vra_rep.value == ESP_HF_VR_STATE_ENABLED && !s_audio_on.load()) {
+                s_audio_wanted.store(true);  // インカムのボタンで頼まれた
                 esp_hf_ag_audio_connect(p->vra_rep.remote_addr);
             }
             break;
@@ -689,7 +699,8 @@ void gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t* p) {
             ESP_LOGI(TAG, "passkey %06lu", (unsigned long)p->key_notif.passkey);
             break;
         case ESP_BT_GAP_ACL_CONN_CMPL_STAT_EVT:
-            ESP_LOGI(TAG, "ACL connected, stat %d", p->acl_conn_cmpl_stat.stat);
+            ESP_LOGI(TAG, "ACL connected, stat %d, Core2 は%s", p->acl_conn_cmpl_stat.stat,
+                     bt_diag_role(p->acl_conn_cmpl_stat.bda) == 0 ? "親機" : "子機");
             break;
         case ESP_BT_GAP_ACL_DISCONN_CMPL_STAT_EVT:
             ESP_LOGI(TAG, "ACL disconnected, reason 0x%x", p->acl_disconn_cmpl_stat.reason);
@@ -898,6 +909,8 @@ bool connect_saved() {
 
 bool reconnecting() { return s_reconnecting.load(); }
 
+int link_role() { return s_has_peer ? bt_diag_role(s_peer) : -1; }
+
 void disconnect() {
     s_disc_requested.store(true);  // 自分で切ったときは、つなぎ直さない
     stop_reconnect("切断した");
@@ -912,13 +925,17 @@ bool audio_busy() {
 }
 
 void audio_open() {
+    s_audio_wanted.store(true);
     if (audio_busy() || g_state.bt_state.load() != BtState::Connected) return;
     mark_audio_request();
     event_log("音声接続を開きます");
     esp_hf_ag_audio_connect(s_peer);
 }
 
+bool audio_wanted() { return s_audio_wanted.load(); }
+
 void audio_close() {
+    s_audio_wanted.store(false);
     if (audio_busy() || !s_audio_on.load()) return;
     if (s_reopening.exchange(false)) esp_timer_stop(s_reopen_timer);  // 閉じたままにする
     mark_audio_request();
@@ -928,7 +945,7 @@ void audio_close() {
 }
 
 bool audio_reopen() {
-    if (!s_audio_on.load() || audio_busy() || s_reopening.load()) return false;
+    if (!s_audio_on.load() || !s_audio_wanted.load() || audio_busy() || s_reopening.load()) return false;
     s_reopening.store(true);
     event_log("音声接続を開き直します");
     mark_audio_request();

@@ -9,6 +9,7 @@ enum class Cue {
     PowerOff,  // ソ ミ ド
     RecStart,  // ソ ド
     RecStop,   // ド ソ
+    Warning,   // ド・ド・ド（SD の残りが少ない・満杯）
     SyncPip,   // 映像同期の予報音（660Hz 60ms）
     SyncMark,  // 映像同期の正報音（1320Hz 0.5 秒）
 };

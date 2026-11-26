@@ -38,6 +38,8 @@ void write_rtc(const struct tm& t) {
     M5.Rtc.setDateTime(dt);
 }
 
+}  // namespace
+
 bool parse_datetime(const char* s, struct tm* out) {
     int y, mo, d, h, mi, sec = 0;
     if (sscanf(s, "%d-%d-%d %d:%d:%d", &y, &mo, &d, &h, &mi, &sec) < 5) return false;
@@ -53,6 +55,8 @@ bool parse_datetime(const char* s, struct tm* out) {
     *out = t;
     return true;
 }
+
+namespace {
 
 // SD カードの settime.txt があれば読む
 bool read_settime_file(struct tm* out) {

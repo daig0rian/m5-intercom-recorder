@@ -62,6 +62,16 @@ sdmmc_card_t* s_card = nullptr;
 bool s_stopped = false;  // シャットダウン後は抜き差しの確認もしない
 esp_err_t s_format_result = ESP_FAIL;  // Format の結果（done を渡す前に書く）
 
+// 空きの見込み。測った値から、そのあと録音で書いた量を引く（測る間にも満杯の手前で止められるように）
+uint64_t s_free_measured = 0;   // 最後に測った空き（バイト）
+uint64_t s_written_since = 0;   // 測ってから録音ファイルに書いた量
+
+void publish_free_space() {
+    uint64_t est = s_free_measured > s_written_since ? s_free_measured - s_written_since : 0;
+    g_state.sd_free_mb.store(static_cast<uint32_t>(est / (1024 * 1024)));
+    g_state.sd_full.store(est < static_cast<uint64_t>(kReserveMb) * 1024 * 1024);
+}
+
 void update_free_space() {
     uint64_t total = 0, free_bytes = 0;
     esp_err_t err;
@@ -69,7 +79,24 @@ void update_free_space() {
         SpiLockGuard lock;
         err = esp_vfs_fat_info(kMountPoint, &total, &free_bytes);
     }
-    if (err == ESP_OK) g_state.sd_free_mb.store(static_cast<uint32_t>(free_bytes / (1024 * 1024)));
+    if (err != ESP_OK) return;
+    s_free_measured = free_bytes;
+    s_written_since = 0;
+    publish_free_space();
+}
+
+void forget_free_space() {
+    s_free_measured = 0;
+    s_written_since = 0;
+    g_state.sd_free_mb.store(0);
+    g_state.sd_full.store(false);  // カードがないときは「満杯」ではなく「カードがない」
+}
+
+// カードを認識したときのログ。空きと、16kHz で録れる時間
+void log_card_space() {
+    uint32_t mb = g_state.sd_free_mb.load();
+    event_log("SDカードの空き %lu.%luGB（約 %lu 時間）", (unsigned long)(mb / 1024),
+              (unsigned long)(mb % 1024 * 10 / 1024), (unsigned long)(minutes_left(0) / 60));
 }
 
 bool enqueue(const Msg& m) {
@@ -133,6 +160,7 @@ bool try_mount(bool quiet, bool format = false) {
         if (!quiet) ESP_LOGW(TAG, "SD mount failed: %s", esp_err_to_name(err));
         s_card = nullptr;
         g_state.sd_mounted.store(false);
+        forget_free_space();
         // カードの初期化までは通り、FAT として読めなかったときは ESP_FAIL（入っていないときはタイムアウトなど）
         g_state.sd_unreadable.store(err == ESP_FAIL);
         return false;
@@ -141,6 +169,7 @@ bool try_mount(bool quiet, bool format = false) {
     g_state.sd_unreadable.store(false);
     if (!quiet) sdmmc_card_print_info(stdout, s_card);
     update_free_space();
+    if (!quiet) log_card_space();
     return true;
 }
 
@@ -153,6 +182,7 @@ void writer_task(void*) {
     bool dirty = false;
     bool fp_wav = false;     // いま開いている録音ファイルが WAV
     uint32_t fp_bytes = 0;   // いま開いている録音ファイルに書いた量
+    bool fp_failed = false;  // いま開いている録音ファイルに書けなかった（もう書かない）
     uint32_t kb_rest = 0;    // written_kb に数えていない端数（バイト）
 
     // ログのファイル（SD の LOG フォルダに日付ごと）。録音ファイルとは別に開いておく
@@ -205,7 +235,7 @@ void writer_task(void*) {
         esp_vfs_fat_sdcard_unmount(kMountPoint, s_card);
         s_card = nullptr;
         g_state.sd_mounted.store(false);
-        g_state.sd_free_mb.store(0);
+        forget_free_space();
     };
 
     // ここまで書いた分を SD に確定する。WAV なら、頭の長さも今の長さに書き直してから確定する
@@ -226,17 +256,51 @@ void writer_task(void*) {
         fp = nullptr;
     };
 
+    // 録音ファイルに書けなかった（満杯の手前で止められなかった・カードの不具合など）。このファイルにはもう書かない。
+    // 頭の長さは、実際に SD にある長さで書き直す（fwrite が受け取っても SD に書けなかった分を数えないように。
+    // 書けなかった分があとで書けても、末尾に足されるだけで、頭の長さがファイルより長くはならない）
+    auto on_write_failed = [&]() {
+        esp_err_t st;
+        {
+            SpiLockGuard lock;
+            st = sdmmc_get_status(s_card);
+        }
+        if (st != ESP_OK) {
+            last_card = 0;  // 抜かれた。すぐ抜き差しの確かめに任せる
+            return;
+        }
+        fp_failed = true;
+        dirty = true;  // 次の確定で頭の長さを書き直す
+        {
+            SpiLockGuard lock;
+            fflush(fp);
+            off_t end = lseek(fileno(fp), 0, SEEK_END);
+            if (end >= 0) {
+                uint32_t e = static_cast<uint32_t>(end);
+                fp_bytes = fp_wav && e > wav::kHeaderBytes ? wav::kHeaderBytes + ((e - wav::kHeaderBytes) & ~1u) : e;
+            }
+        }
+        update_free_space();  // 満杯なら、録音の側が止める
+        if (!g_state.sd_full.load()) event_log("SDカードに書けませんでした");
+    };
+
     for (;;) {
         Msg m;
         if (xQueueReceive(s_queue, &m, pdMS_TO_TICKS(500)) == pdTRUE) {
             switch (m.type) {
                 case MsgType::Open: {
                     close_fp();
+                    fp_wav = m.wav;
+                    fp_bytes = 0;
+                    fp_failed = false;
+                    if (g_state.sd_full.load()) {
+                        // 満杯の手前。空のファイルを作らない（録音の側も、満杯を見て止める）
+                        ESP_LOGW(TAG, "open %s skipped: SD full", m.path);
+                        break;
+                    }
                     SpiLockGuard lock;
                     mkdir(kRecDir, 0777);
                     fp = fopen(m.path, "wb");
-                    fp_wav = m.wav;
-                    fp_bytes = 0;
                     if (fp) {
                         if (vbuf) setvbuf(fp, vbuf, _IOFBF, 8192);
                         ESP_LOGI(TAG, "open %s", m.path);
@@ -248,7 +312,7 @@ void writer_task(void*) {
                     break;
                 }
                 case MsgType::Data:
-                    if (fp) {
+                    if (fp && !fp_failed) {
                         size_t w = 0;
                         while (w < m.len) {
                             size_t n = std::min<size_t>(m.len - w, kWriteSliceBytes);
@@ -265,9 +329,11 @@ void writer_task(void*) {
                         g_state.written_kb.fetch_add(kb_rest / 1024);
                         kb_rest %= 1024;
                         if (w) dirty = true;
+                        s_written_since += w;
+                        publish_free_space();
                         if (w != m.len) {
                             g_state.write_errors.fetch_add(1);
-                            last_card = 0;  // 抜かれたかもしれないので、すぐ確かめる
+                            on_write_failed();
                         }
                     }
                     heap_caps_free(m.data);
@@ -322,13 +388,17 @@ void writer_task(void*) {
                             esp_vfs_fat_sdcard_unmount(kMountPoint, s_card);
                             s_card = nullptr;
                             g_state.sd_mounted.store(false);
+                            forget_free_space();
                         }
                     } else {
                         // FAT として読めないカード（exFAT など）は、マウントできなければ初期化する設定でマウントし直す
                         err = try_mount(false, true) ? ESP_OK : ESP_FAIL;
                     }
                     ESP_LOGI(TAG, "format: %s", esp_err_to_name(err));
-                    if (err == ESP_OK) update_free_space();
+                    if (err == ESP_OK) {
+                        update_free_space();
+                        log_card_space();
+                    }
                     last_card = millis32();
                     last_free = last_card;
                     s_format_result = err;
@@ -354,7 +424,10 @@ void writer_task(void*) {
             }
             last_card = now;
         } else if (!g_state.sd_mounted.load() && now - last_card >= kRemountMs) {
-            if (try_mount(true)) event_log("SDカードを認識しました");
+            if (try_mount(true)) {
+                event_log("SDカードを認識しました");
+                log_card_space();
+            }
             last_card = now;
             last_free = now;
         }
@@ -379,6 +452,14 @@ void writer_task(void*) {
 }
 
 }  // namespace
+
+uint32_t minutes_left(uint32_t sample_rate) {
+    if (sample_rate == 0) sample_rate = 16000;
+    uint32_t mb = g_state.sd_free_mb.load();
+    if (mb <= kReserveMb) return 0;
+    uint64_t bytes = static_cast<uint64_t>(mb - kReserveMb) * 1024 * 1024;
+    return static_cast<uint32_t>(bytes / (static_cast<uint64_t>(sample_rate) * sizeof(int16_t) * 60));
+}
 
 bool mount() { return try_mount(false); }
 

@@ -33,6 +33,8 @@ constexpr Note kPowerOn[] = {{kC5, kNoteMs}, {kE5, kNoteMs}, {kG5, kNoteMs}};
 constexpr Note kPowerOff[] = {{kG5, kNoteMs}, {kE5, kNoteMs}, {kC5, kNoteMs}};
 constexpr Note kRecStart[] = {{kG5, kNoteMs}, {kC6, kNoteMs}};
 constexpr Note kRecStop[] = {{kC6, kNoteMs}, {kG5, kNoteMs}};
+// 注意の音。操作音（30ms の音を続ける）と聞き分けられるよう、長めの同じ音を間を空けて 3 回（hz = 0 は休み）
+constexpr Note kWarning[] = {{kC5, 120}, {0, 80}, {kC5, 120}, {0, 80}, {kC5, 120}};
 // 映像同期の音。Core2 のスピーカーから B+COM のマイクを通して録ると、低い音ほど入りにくく（440Hz はほぼ入らない）、
 // 1320Hz あたりがいちばん入った。編集で波形の立ち上がりを見つけやすいよう、正報音は 1320Hz にする
 // （録音で約 -35dBFS。880Hz のときは約 -50dBFS だった）。予報音は、時報と同じく正報音の 1 オクターブ下（約 -43dBFS）
@@ -45,7 +47,7 @@ std::atomic<int> s_pending{0};  // 鳴らし終わっていない操作音の数
 template <size_t N>
 void play_notes(const Note (&notes)[N]) {
     for (const Note& n : notes) {
-        M5.Speaker.tone(n.hz, n.ms, kChannel, true, kSquareWave, sizeof(kSquareWave));
+        if (n.hz > 0) M5.Speaker.tone(n.hz, n.ms, kChannel, true, kSquareWave, sizeof(kSquareWave));
         vTaskDelay(pdMS_TO_TICKS(n.ms));
     }
 }
@@ -59,6 +61,7 @@ void sound_task(void*) {
             case Cue::PowerOff: play_notes(kPowerOff); break;
             case Cue::RecStart: play_notes(kRecStart); break;
             case Cue::RecStop: play_notes(kRecStop); break;
+            case Cue::Warning: play_notes(kWarning); break;
             case Cue::SyncPip: play_notes(kSyncPip); break;
             case Cue::SyncMark: play_notes(kSyncMark); break;
         }

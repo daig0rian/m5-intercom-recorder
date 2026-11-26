@@ -144,6 +144,10 @@ void watch_check(uint32_t rate) {
     int64_t now = esp_timer_get_time();
     int64_t el = now - s_watch.start_us;
     if (el < kWatchWindowUs) return;
+    if (!bt_ag::audio_wanted()) {  // 閉じている最中（閉じた知らせを待っている間）は、届かなくて当然
+        watch_reset_window();
+        return;
+    }
     uint32_t got = g_state.rx_bytes.load() - s_watch.rx_bytes;
     uint32_t expected = static_cast<uint32_t>(static_cast<int64_t>(rate) * 2 * el / 1000000);
     bool starving = got * 2 < expected;
@@ -322,7 +326,8 @@ void audio_task(void*) {
             }
         }
 
-        bool want_rec = g_state.rec_requested.load() && g_state.sd_mounted.load();
+        // SD が満杯の手前になったら、ファイルを閉じて止める（録音の頼みは UI が下ろして知らせる）
+        bool want_rec = g_state.rec_requested.load() && g_state.sd_mounted.load() && !g_state.sd_full.load();
         if (!want_rec) {
             if (s_file_open) finish_file();
             s_gap = false;
