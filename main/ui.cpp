@@ -174,7 +174,7 @@ void fmt_hms(char* out, size_t len, uint32_t sec) {
 // 接続の状態（メイン画面のヘッダー下段）
 const char* link_label() {
     BtState st = g_state.bt_state.load();
-    if (bt_ag::reconnecting() && st <= BtState::Connecting) return "つなぎ直し中…";
+    if (bt_ag::reconnecting() && st <= BtState::Connecting) return "再接続中…";
     switch (st) {
         case BtState::Off: return "Bluetooth 停止";
         case BtState::Idle: return "未接続";
@@ -383,6 +383,7 @@ bool usb_power() {
 
 // 電池の試験（電池が切れるまでの時間を測る）のときだけ true にする。電池で動いている間、
 // 残量の % が変わったときと、変わらなくても kBatteryLogIntervalMs ごとに、前の行からの平均の電圧と放電電流をログに書く。
+// 起動したときの電源 IC も、ログに書く（ふだんはシリアルにだけ出す）。
 constexpr bool kBatteryTestLog = false;
 constexpr uint32_t kBatteryLogIntervalMs = 5 * 60 * 1000;
 
@@ -426,7 +427,7 @@ void read_power() {
         s_battery = M5.Power.getBatteryLevel();
     }
     if (s_usb_logged != static_cast<int>(usb)) {
-        event_log(usb ? "USB から給電中 (電池 %dmV)" : "電池で動作中 (電池 %dmV)", bat_mv);
+        event_log(usb ? "USBから給電中 (電池 %dmV)" : "電池で動作中 (電池 %dmV)", bat_mv);
         s_usb_logged = usb;
     }
     battery_test_log(on_battery, s_battery, bat_mv, now);
@@ -500,13 +501,13 @@ void draw_main() {
     char drop_s[12];
     if (drop >= 0) snprintf(drop_s, sizeof(drop_s), "%d.%d%%", drop / 10, drop % 10);
     else strlcpy(drop_s, "-", sizeof(drop_s));
-    snprintf(b, sizeof(b), "受信 %lu.%lukB/s  欠け %s  溢れ %lu  音割れ %lu", (unsigned long)(s_rx_kbps_x10 / 10),
+    snprintf(b, sizeof(b), "受信 %lu.%lukB/s  Err %s  OFlow %lu  Clip %lu", (unsigned long)(s_rx_kbps_x10 / 10),
              (unsigned long)(s_rx_kbps_x10 % 10), drop_s, (unsigned long)g_state.ring_overflows.load(),
              (unsigned long)g_state.clip_frames.load());
     text(kFont12, kText, 6, y, b);
     y += lh;
     uint32_t free_mb = g_state.sd_free_mb.load();
-    snprintf(b, sizeof(b), "書込 %luMB  エラー %lu  空き %lu.%luGB", (unsigned long)(g_state.written_kb.load() / 1024),
+    snprintf(b, sizeof(b), "書込 %luMB  Err %lu  Free %lu.%luGB", (unsigned long)(g_state.written_kb.load() / 1024),
              (unsigned long)(g_state.write_errors.load() + g_state.write_queue_drops.load()),
              (unsigned long)(free_mb / 1024), (unsigned long)(free_mb % 1024 * 10 / 1024));
     text(kFont12, kText, 6, y, b);
@@ -1146,7 +1147,7 @@ const char* set_clock(const struct tm& local) {
     if (diff == 0) {
         snprintf(was, sizeof(was), "ずれなし");
     } else if (diff > -86400 && diff < 86400) {
-        snprintf(was, sizeof(was), "%ld 秒%s", diff > 0 ? diff : -diff, diff > 0 ? "遅れていた" : "進んでいた");
+        snprintf(was, sizeof(was), "%ld秒%s", diff > 0 ? diff : -diff, diff > 0 ? "進めた" : "戻した");
     } else {
         struct tm old;
         localtime_r(&before, &old);
@@ -1280,7 +1281,7 @@ bool check_sd_space() {
         }
         // ログは 1 行 96 バイトまで・画面の幅に収まるよう、2 行に分ける
         event_log("SDカードがいっぱいです（空き %luMB）", (unsigned long)g_state.sd_free_mb.load());
-        event_log("古い録音を PC で消すか、初期化してください");
+        event_log("古い録音をPCで消すか、初期化してください");
         sound::play(sound::Cue::Warning);
         toast("SDカードがいっぱいです");
         return true;
@@ -1344,7 +1345,7 @@ constexpr const char* kNoPeer = "接続先がありません（機器を探し�
 // 最後に接続した機器につなぐ
 const char* bt_connect() {
     BtState st = g_state.bt_state.load();
-    if (bt_ag::reconnecting()) return "つなぎ直し中です";
+    if (bt_ag::reconnecting()) return "再接続中です";
     if (st == BtState::Discovering) return "機器を検索中です";
     if (st == BtState::Idle && !bt_ag::connect_saved()) return kNoPeer;
     return nullptr;  // つながっている・つなぎに行っているときは何もしない
@@ -1445,12 +1446,12 @@ void format_sd() {
     strlcpy(s_toast, "SD カードを初期化しています…", sizeof(s_toast));
     s_toast_until = UINT32_MAX;
     render_full();
-    event_log("SD カードの初期化を開始");
+    event_log("SDカードの初期化を開始");
     uint32_t t0 = millis32();
     bool ok = storage::format_card(kFormatTimeoutMs);
     uint32_t sec = (millis32() - t0) / 1000;
-    if (ok) event_log("SD カードを初期化しました（%lu 秒）", (unsigned long)sec);
-    else event_log("SD カードを初期化できませんでした（%lu 秒）", (unsigned long)sec);
+    if (ok) event_log("SDカードを初期化しました（%lu 秒）", (unsigned long)sec);
+    else event_log("SDカードを初期化できませんでした（%lu 秒）", (unsigned long)sec);
     toast(ok ? "SD カードを初期化しました" : "初期化できませんでした");
 }
 
@@ -1790,6 +1791,9 @@ constexpr const char* kHelp[] = {
     "hcilog on|off           Bluetooth のホストとコントローラーのやり取り（HCI）を @hci の行で出す（調べるとき用）",
     "hcicmd <命令> [引数]    HCI のコマンドを直接送る（命令は 4 桁の 16 進。引数は 16 進で、peer は接続先のアドレス、",
     "                        handle は接続のハンドルに置き換える。例: hcicmd 080b peer 01 で Core2 が子機になる）",
+    "scolog on|off           音声のパケットと mSBC の復号を数えて、10 秒ごとに @sco の行で出す（調べるとき用）。",
+    "                        受信の見張りが音の異常を見つけると、その前後 1 件ずつを @scod の行で出す",
+    "scodump                 いまの前後の 1 件ずつを @scod の行で出す（30 秒に 1 回まで）",
     "format yes              SD カードを初期化する",
     "reset yes               設定を初期化する（再起動する）",
     "poweroff                電源を切る（電源ボタンの長押し）",
@@ -2041,6 +2045,17 @@ void run_command(char* line) {
         bt_diag_hci_log(on);
         if (bt_diag_hci_logging() == on) reply_ok(cmd);
         else reply_err(cmd, "記録の置き場を取れません");
+    } else if (is("scolog") && parse_on_off(w[1], &on)) {
+        bt_diag_sco_log(on);
+        if (bt_diag_sco_logging() == on) reply_ok(cmd);
+        else reply_err(cmd, "記録の置き場を取れません");
+    } else if (is("scodump") && !w[1]) {
+        if (!bt_diag_sco_logging()) {
+            reply_err(cmd, "scolog on のあとで");
+        } else {
+            bt_diag_sco_dump("serial");
+            reply_ok(cmd);
+        }
     } else if (is("format") && arg_is("yes")) {
         reply(cmd, format_card());
     } else if (is("reset") && arg_is("yes")) {
@@ -2161,6 +2176,14 @@ void ui_task(void*) {
 }  // namespace
 
 void start() {
+    // 電池の残量の出し方は電源 IC で変わる（read_power）。電池の試験のときは、どちらだったかを SD のログにも残す
+    const auto pmic = M5.Power.getType();
+    const char* pmic_name = pmic == m5::Power_Class::pmic_axp192    ? "AXP192"
+                            : pmic == m5::Power_Class::pmic_axp2101 ? "AXP2101"
+                                                                     : "不明";
+    if (kBatteryTestLog) event_log("電源 IC：%s", pmic_name);
+    else ESP_LOGI("ui", "電源 IC：%s", pmic_name);
+
     M5.Display.setBrightness(kBrightness[s_brightness]);
     s_cv.setColorDepth(16);
     s_cv.setPsram(true);

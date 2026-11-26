@@ -6,6 +6,7 @@
 
 #include "app_state.h"
 #include "bt_ag.h"
+#include "bt_diag.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -14,6 +15,7 @@
 #include "level_meter.h"
 #include "pcm_ring.h"
 #include "rtc_clock.h"
+#include "sound.h"
 #include "storage.h"
 #include "wav_writer.h"
 
@@ -42,7 +44,7 @@ uint32_t s_file_bytes = 0;  // 頭を含むファイルの長さ
 // 受信の見張りが働いている間（音声接続は開いているが、まともな音が届いていない）も同じように無音にする
 bool s_gap = false;
 bool s_gap_resume = false;  // 次に届いたフレームで途切れを終え、そこから届いた音を書く
-bool s_gap_from_loop = false;  // 同じ波形のくり返しが続いたので無音にしている（くり返しが止まれば戻す）
+bool s_gap_from_plc = false;  // 補間で作ったフレームが続いたので無音にしている（補間でないフレームが来れば戻す）
 uint32_t s_gap_frames = 0;
 
 // ---- 録音の時間軸 ------------------------------------------------------------
@@ -77,64 +79,63 @@ void timeline_track(int64_t now, int64_t buffered_us) {
 }
 
 // ---- 受信の見張り ----------------------------------------------------------
-// 音声接続が開いたまま、音がほとんど届かなくなる、または届く音が同じ波形のくり返しになる
-// （Bluedroid の欠損補間が、壊れたフレームを直前の波形のくり返しで埋め続けている）ことがある。
-// 2 秒ごとに確かめ、そうなっていたら音声接続を開き直す。
-// 受信パケットの誤りが多い（電波が悪い）ときは、すぐには開き直さない（離れていく途中などで、
-// 開き直すとかえって音が戻らなくなるため）。それでも 10 秒続いたら開き直す。
+// 音声接続が開いたまま、まともな音が届かなくなることがある。2 秒ごとに次のどれかに当たるかを確かめ、
+// 当たれば、録音をそこから無音にして、音声接続を開き直す。
+// - 届いた PCM が、2 秒で届くはずの量の半分に満たない。復号器が「データが足りない」で終わると、Bluedroid は
+//   音を出さず、補間もしない（パケットが正しく届いた印のままでも起きる）
+// - 届いた音の 99% 以上が、Bluedroid の欠損補間で作ったもの（mSBC。msbc_plc.c で見分ける）。補間は直前の
+//   波形を弱めずにくり返すので、音の中身では見分けられない（直前が無音なら、無音がくり返される）
+// - 受信パケットの 99% 以上が誤り・受信なし（CVSD には補間がないので、これで見る）
+//
+// 時間の決め方。壊れてから気づくまで 2〜4 秒（窓が 2 秒で、パケットの数えも 2 秒ごとに届くため）。
+// - 受信パケットの半分以上に誤りがある（電波が悪い）ときは、気づいてから kWatchRadioWaitUs 待ってから開き直す。
+//   電波が本当に途絶えたら、監視の時間（Core2 が親機のとき Core2 が決める。Bluedroid の既定
+//   BTA_DM_LINK_TIMEOUT 8000 スロット = 5.0 秒）でつながりごと切れ、つなぎ直しに任せられる。気づくまでと
+//   待ちで 7〜9 秒になり、監視の時間を超えるので、途絶えたときに開き直しが空振りしない。逆に、それより長く
+//   誤りが続いてもつながりが切れないなら、電波は途絶えておらず、音声接続だけが止まっている。
+//   電波が悪いうちに開き直さないのは、開くのに失敗すると Bluedroid が T1・CVSD に格下げするため
+//   （bt_ag.cpp の kReopenRetryUs）
+// - 開き直しても直らなければ、続けて開き直す。開いたあと 2 秒分を見てから決めるので、約 2.5 秒おきになる。
+//   kMaxReopens 回で直らなければやめて、ログと注意の音で知らせる（開き直すたびに、B+COM ではヘルメットの中で
+//   ビープと「ポポポポポ」が鳴るため）。自然に直るか、開き直し以外（B2・つなぎ直し・メニュー）で音声接続が
+//   開けば、数え直す
 constexpr int64_t kWatchWindowUs = 2 * 1000 * 1000;
-constexpr int64_t kWatchRadioWaitUs = 10 * 1000 * 1000;
-constexpr int kRepeatMinLag = 56;   // Bluedroid の欠損補間がくり返す周期（16kHz のサンプル数）の範囲
-constexpr int kRepeatMaxLag = 311;
-// 同じ波形のくり返しがこれだけ続いたら、2 秒の見張りを待たずに無音にする（10 フレーム = 200ms）。
-// 欠損補間は弱めずにくり返し続け、大きな雑音に変わることもあるため。これより短いくり返し（短い抜けの補間）はそのまま書く
-constexpr uint32_t kMuteRepeatFrames = 10;
-uint32_t s_repeat_run = 0;  // くり返しのフレームが続いている数
+constexpr int64_t kWatchRadioWaitUs = 5 * 1000 * 1000;
+constexpr int kMaxReopens = 3;
+constexpr int kBadPermille = 990;  // 補間・パケットの誤りがこの割合（‰）以上なら、まともな音は届いていない
+// 補間で作ったフレームがこれだけ続いたら、2 秒の見張りを待たずに無音にする（10 フレーム = 200ms）。
+// 補間は弱めずにくり返し続け、大きな雑音に変わることもあるため。これより短い補間（短い抜け）はそのまま書く
+constexpr uint32_t kMutePlcFrames = 10;
+uint32_t s_plc_run = 0;  // 全部が補間で作った音のフレームが続いている数
 
 struct Watch {
     int64_t start_us = 0;
     uint32_t rx_bytes = 0;
-    uint32_t frames = 0;   // 窓の中で読んだフレーム
-    uint32_t repeats = 0;  // そのうち、前の波形のくり返しだったフレーム
-    bool bad = false;      // まともな音が届いていない
+    uint32_t samples = 0;      // 窓の中で読んだサンプル
+    uint32_t plc_samples = 0;  // そのうち、補間で作ったもの
+    bool bad = false;          // まともな音が届いていない
     int64_t bad_since_us = 0;
-    int64_t last_reopen_us = 0;
-    int reopens = 0;       // 直らないまま開き直した回数
+    int reopens = 0;           // 直らないまま開き直した回数
+    bool gave_up = false;      // kMaxReopens 回開き直しても直らず、やめた
 };
 Watch s_watch;
-int16_t s_prev_frame[kMaxFrameSamples];
-bool s_prev_valid = false;
 
 void watch_reset_window() {
     s_watch.start_us = esp_timer_get_time();
     s_watch.rx_bytes = g_state.rx_bytes.load();
-    s_watch.frames = 0;
-    s_watch.repeats = 0;
+    s_watch.samples = 0;
+    s_watch.plc_samples = 0;
 }
 
-// 音声接続が開いた・閉じたとき。見張りの窓を始め直す（悪い状態かどうかと、開き直した回数は残す）
-void watch_source_changed() {
+// 音声接続が開いた・閉じたとき（rate は新しいサンプルレート。閉じたら 0）。見張りの窓を始め直す
+// （悪い状態かどうかは残す）。開き直し以外で開いたら、開き直した回数を数え直す
+void watch_source_changed(uint32_t rate) {
     watch_reset_window();
-    s_prev_valid = false;
-    s_repeat_run = 0;
-}
-
-// このフレームが、前のフレームから続く同じ波形のくり返しか（ある周期で全サンプルが一致する）。
-// 自然な音ではまず起きない。ほとんど無音のフレームは調べない（無音は、どの周期でも一致してしまう）
-bool is_repeat(const int16_t* cur, size_t n) {
-    if (!s_prev_valid || n != static_cast<size_t>(kMaxFrameSamples)) return false;
-    uint32_t sum = 0;
-    for (size_t i = 0; i < n; i++) sum += static_cast<uint32_t>(cur[i] < 0 ? -cur[i] : cur[i]);
-    if (sum < n * 4) return false;
-    for (int lag = kRepeatMinLag; lag <= kRepeatMaxLag; lag++) {
-        size_t i = 0;
-        for (; i < n; i++) {
-            int16_t past = i >= static_cast<size_t>(lag) ? cur[i - lag] : s_prev_frame[n + i - lag];
-            if (cur[i] != past) break;
-        }
-        if (i == n) return true;
+    s_plc_run = 0;
+    if (rate != 0 && !bt_ag::last_open_was_reopen()) {
+        s_watch.reopens = 0;
+        s_watch.gave_up = false;
     }
-    return false;
 }
 
 void start_gap();
@@ -151,28 +152,31 @@ void watch_check(uint32_t rate) {
     uint32_t got = g_state.rx_bytes.load() - s_watch.rx_bytes;
     uint32_t expected = static_cast<uint32_t>(static_cast<int64_t>(rate) * 2 * el / 1000000);
     bool starving = got * 2 < expected;
-    bool looping = s_watch.frames >= 25 && s_watch.repeats * 4 >= s_watch.frames * 3;
-    uint32_t got_pct = expected ? got * 100 / expected : 0;
+    // 補間の割合は、0.5 秒分以上読んだときだけ見る（読んだ量が少ないときは starving が見る）
+    bool plc = s_watch.samples >= rate / 2 &&
+               static_cast<uint64_t>(s_watch.plc_samples) * 1000 >= static_cast<uint64_t>(s_watch.samples) * kBadPermille;
+    int drop = g_state.pkt_drop_x10.load();  // 直近 2 秒の受信パケットの誤り（‰）。-1 = まだ分からない
+    bool dead = drop >= kBadPermille;
     watch_reset_window();
 
-    if (!starving && !looping) {
+    if (!starving && !plc && !dead) {
         if (s_watch.bad) {
             s_watch.bad = false;
             s_watch.reopens = 0;
+            s_watch.gave_up = false;
             if (s_gap) s_gap_resume = true;  // 開き直さずに戻った。次に届いたフレームから書く
-            event_log("音声がまた届くようになりました");
+            event_log("音声データがまた届くようになりました");
         }
         return;
     }
 
-    int drop = g_state.pkt_drop_x10.load();  // -1 = まだ分からない
     if (!s_watch.bad) {
         s_watch.bad = true;
         s_watch.bad_since_us = now;
-        char err[24] = "不明";
-        if (drop >= 0) snprintf(err, sizeof(err), "%d.%d%%", drop / 10, drop % 10);
-        if (starving) event_log("音声がほとんど届きません（2 秒で %lu%%、受信の誤り %s）", (unsigned long)got_pct, err);
-        else event_log("届く音が同じ波形のくり返しです（受信の誤り %s）", err);
+        if (starving) event_log("音声データの受信が半分未満の状態が2秒続きました");
+        else event_log("音声データの受信ほぼなしの状態が2秒続きました");  // 補間ばかり（plc）か、パケットが届かない（dead）
+        // 調べるとき（scolog on）だけ書き出す
+        bt_diag_sco_dump(starving ? "starving" : plc ? "plc" : "dead");
     }
     // 録音中なら、ここから無音にする（開き直したあとも直っていなければ、また無音にする）。
     // 届かなかった分も、時間軸に合わせて埋める
@@ -181,13 +185,15 @@ void watch_check(uint32_t rate) {
 
     bool radio = drop >= 500;  // 受信パケットの半分以上に誤り
     if (radio && now - s_watch.bad_since_us < kWatchRadioWaitUs) return;
-    // 開き直しても直らないときは、間を空けて試し続ける（10 秒、10 秒、それからは 60 秒ごと）
-    int64_t wait_us = s_watch.reopens == 0 ? 0 : s_watch.reopens < 3 ? 10 * 1000000LL : 60 * 1000000LL;
-    if (s_watch.reopens > 0 && now - s_watch.last_reopen_us < wait_us) return;
-    if (bt_ag::audio_reopen()) {
-        s_watch.reopens++;
-        s_watch.last_reopen_us = now;
+    if (s_watch.reopens >= kMaxReopens) {
+        if (!s_watch.gave_up) {
+            s_watch.gave_up = true;
+            event_log("音声接続を %d 回開き直しても直りません", kMaxReopens);
+            sound::play(sound::Cue::Warning);
+        }
+        return;
     }
+    if (bt_ag::audio_reopen()) s_watch.reopens++;
 }
 
 void flush_chunk() {
@@ -278,7 +284,7 @@ void fill_gap(uint32_t max_frames) {
 void start_gap() {
     s_gap = true;
     s_gap_resume = false;
-    s_gap_from_loop = false;
+    s_gap_from_plc = false;
     s_gap_frames = 0;
 }
 
@@ -292,8 +298,8 @@ void end_gap(int64_t now, int64_t buffered_us) {
     }
     s_gap = false;
     s_gap_resume = false;
-    s_gap_from_loop = false;
-    event_log("途切れていた %lu.%lu 秒を無音で埋めました", (unsigned long)(s_gap_frames / 50),
+    s_gap_from_plc = false;
+    event_log("音声データが届かなかった %lu.%lu 秒を無音で埋めました", (unsigned long)(s_gap_frames / 50),
               (unsigned long)(s_gap_frames % 50 / 5));
 }
 
@@ -301,7 +307,7 @@ void audio_task(void*) {
     static int16_t frame[kMaxFrameSamples];
     uint32_t gen = g_state.source_gen.load();
     uint32_t rate = g_state.sample_rate.load();
-    watch_source_changed();
+    watch_source_changed(rate);
 
     for (;;) {
         // 音声接続が開いた・閉じた
@@ -310,7 +316,7 @@ void audio_task(void*) {
             gen = g;
             rate = g_state.sample_rate.load();
             g_pcm_ring.discard_all();
-            watch_source_changed();
+            watch_source_changed(rate);
             if (rate == 0) {
                 // 受信の見張りで無音にしている途中なら、そのまま続ける
                 if (s_tl.valid && !s_gap) start_gap();
@@ -351,13 +357,12 @@ void audio_task(void*) {
         }
         int64_t now = esp_timer_get_time();
         int64_t buffered_us = static_cast<int64_t>(avail) * 1000000 / rate;
-        g_pcm_ring.read(frame, n);
-        bool rep = is_repeat(frame, n);
-        s_watch.frames++;
-        if (rep) s_watch.repeats++;
-        s_repeat_run = rep ? s_repeat_run + 1 : 0;
-        memcpy(s_prev_frame, frame, n * sizeof(int16_t));
-        s_prev_valid = n == static_cast<size_t>(kMaxFrameSamples);
+        size_t plc = 0;
+        g_pcm_ring.read(frame, n, &plc);
+        s_watch.samples += n;
+        s_watch.plc_samples += plc;
+        bool plc_frame = plc == n;  // フレームの全部が補間で作った音
+        s_plc_run = plc_frame ? s_plc_run + 1 : 0;
 
         // レベル計測（AGC などをかける前の値）
         FrameLevel lv = measure_frame(frame, n);
@@ -366,12 +371,13 @@ void audio_task(void*) {
         if (lv.clipped) g_state.clip_frames.fetch_add(1);
         g_state.frames_processed.fetch_add(1);
 
-        // 同じ波形のくり返しが続いたら、このフレームから無音にする。くり返しが止まったら、そこから書く
-        // （止まらずに 2 秒の見張りが気づいたら、開き直しのほうに任せる）
-        if (s_repeat_run == kMuteRepeatFrames && s_tl.valid && !s_gap) {
+        // 補間で作ったフレームが続いたら、このフレームから無音にする。補間でないフレームが来たら、そこから書く
+        // （続いたまま 2 秒の見張りが気づいたら、開き直しのほうに任せる）
+        if (s_plc_run == kMutePlcFrames) bt_diag_sco_dump("plcrun");  // 調べるとき（scolog on）だけ
+        if (s_plc_run == kMutePlcFrames && s_tl.valid && !s_gap) {
             start_gap();
-            s_gap_from_loop = true;
-        } else if (!rep && s_gap_from_loop && !s_watch.bad) {
+            s_gap_from_plc = true;
+        } else if (!plc_frame && s_gap_from_plc && !s_watch.bad) {
             s_gap_resume = true;
         }
 
@@ -390,7 +396,7 @@ void audio_task(void*) {
 }  // namespace
 
 void start() {
-    g_pcm_ring.init(16000 * 4, &g_state.ring_overflows);  // 16kHz で 4 秒分
+    g_pcm_ring.init(16000 * 4, &g_state.ring_overflows, true);  // 16kHz で 4 秒分。補間で作った音の印付き
     s_chunk = static_cast<uint8_t*>(heap_caps_malloc(kChunkCap, MALLOC_CAP_SPIRAM));
     if (!s_chunk) s_chunk = static_cast<uint8_t*>(heap_caps_malloc(kChunkCap, MALLOC_CAP_8BIT));
     xTaskCreatePinnedToCore(audio_task, "audio", 12 * 1024, nullptr, 10, nullptr, 1);

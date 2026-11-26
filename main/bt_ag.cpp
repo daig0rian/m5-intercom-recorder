@@ -14,6 +14,7 @@
 #include "esp_hf_ag_api.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "msbc_plc.h"
 #include "pcm_ring.h"
 #include "settings.h"
 
@@ -46,7 +47,11 @@ bool s_connecting_saved = false;  // 保存済みの接続先に接続しよう�
 bool s_peer_bonded = false;       // 最後に接続した機器の鍵を Core2 が持っている
 
 // 録音中に思いがけず切れたら、最後に接続した機器へ定期的につなぎ直しを試みる。B+COM は、離れて切れたあと
-// 近づいても自分からはつなぎ直さない。録音中は接続先が変わらないので、つなぎ先を迷わない
+// 近づいても自分からはつなぎ直さない。録音中は接続先が変わらないので、つなぎ先を迷わない。
+// 相手が応じないと、1 回の試しは呼び出しの時間（Bluedroid の既定 BTA_DM_PAGE_TIMEOUT 8192 スロット = 5.12 秒）だけ
+// 呼び続ける。10 秒ごとなら「5.1 秒呼んで、約 5 秒休む」。つなぎに行っている間の回は飛ばす（reconnect_cb）ので、
+// 間隔を縮めても 10 秒ごとのままで、休みをなくすと呼び続けになる（相手が戻ってからつながるまでは平均 2.5 秒ほど
+// 縮むだけで、途切れている間ずっと呼ぶ分の電流が増える）
 constexpr uint64_t kReconnectIntervalUs = 10 * 1000 * 1000;
 esp_timer_handle_t s_reconnect_timer = nullptr;
 std::atomic<bool> s_reconnecting{false};
@@ -82,7 +87,11 @@ std::atomic<bool> s_audio_wanted{true};
 std::atomic<bool> s_reopening{false};
 esp_timer_handle_t s_reopen_timer = nullptr;
 constexpr uint64_t kReopenOpenDelayUs = 500 * 1000;       // 閉じてから開くまで
-constexpr uint64_t kReopenRetryUs = 5 * 1000 * 1000;      // 開けないときに試し直す間隔
+// 開けないときに試し直す間隔。開けないのは電波などが原因で、相手が応じるようになればそれで録音が戻るので、
+// 回数は限らない。Bluedroid は、Core2 から開いて mSBC で失敗すると、T2 → T1（安全な設定）→ CVSD と格下げして
+// 開き直す（bta_ag_sco.c）。CVSD で開くと 8kHz になり、閉じるまでそのまま（次に開くときはコーデックを交渉し直す）
+constexpr uint64_t kReopenRetryUs = 5 * 1000 * 1000;
+std::atomic<bool> s_open_by_reopen{false};  // 最後に開いた音声接続が、開き直しで開いたものか
 
 // 受信パケットの誤り（2 秒ごとの割合）が多いことをログに残す。多くなったときと、減ったときに 1 行ずつ
 constexpr int kErrHighPct = 25;
@@ -170,20 +179,20 @@ void start_reconnect() {
     s_reconnect_tries = 0;
     char name[40];
     state_get_peer_name(name, sizeof(name));
-    event_log("録音中に切れたので、%.30s につなぎ直します", name);
+    event_log("録音中に切れたので %.30s に再接続します", name);
     esp_timer_start_periodic(s_reconnect_timer, kReconnectIntervalUs);
 }
 
 void stop_reconnect(const char* why) {
     if (!s_reconnecting.exchange(false)) return;
     esp_timer_stop(s_reconnect_timer);
-    if (why) event_log("つなぎ直しをやめました（%s）", why);
+    if (why) event_log("再接続をやめました（%s）", why);
 }
 
 // 試すたびにはログに書かない（つながらない間、ログがあふれるため）。失敗の知らせも、つなぎ直しの間は書かない
 void reconnect_cb(void*) {
-    if (!g_state.rec_requested.load()) return stop_reconnect("録音を止めた");
-    if (!s_has_peer || !s_peer_bonded) return stop_reconnect("ペアリング情報がない");
+    if (!g_state.rec_requested.load()) return stop_reconnect("録音停止");
+    if (!s_has_peer || !s_peer_bonded) return stop_reconnect("ペアリング情報なし");
     if (g_state.bt_state.load() != BtState::Idle) return;  // つなぎに行っている・向こうからつないできた
     s_reconnect_tries++;
     ESP_LOGI(TAG, "reconnect try %d", s_reconnect_tries);
@@ -197,7 +206,7 @@ void reconnect_cb(void*) {
 // 受信（ヘッドセットのマイク音声）。CVSD は 8kHz、mSBC は復号済みの 16kHz の PCM で届く
 void incoming_cb(const uint8_t* buf, uint32_t len) {
     g_state.rx_bytes.fetch_add(len, std::memory_order_relaxed);
-    g_pcm_ring.write(buf, len / 2);
+    g_pcm_ring.write(buf, len / 2, msbc_plc_take());  // 補間で作った音には印を付ける（受信の見張りが使う）
     if (g_state.loopback.load(std::memory_order_relaxed)) s_loop_ring.write(buf, len / 2);
 }
 
@@ -289,12 +298,12 @@ void update_drop_rate(uint32_t total, uint32_t bad) {
         s_err_high = true;
         s_err_high_since_us = esp_timer_get_time();
         s_err_high_max = pct;
-        event_log("受信の誤りが多くなりました（%d%%）", pct);
+        event_log("受信エラー%d%%以上（%d%%）", kErrHighPct, pct);
     } else if (s_err_high) {
         s_err_high_max = std::max(s_err_high_max, pct);
         if (pct < kErrLowPct) {
             s_err_high = false;
-            event_log("受信の誤りが減りました（多かったのは %lu 秒、最大 %d%%）",
+            event_log("受信エラー%d%%未満に回復（%lu 秒間、最大 %d%%）", kErrLowPct,
                       (unsigned long)((esp_timer_get_time() - s_err_high_since_us) / 1000000), s_err_high_max);
         }
     }
@@ -341,7 +350,9 @@ void reopen_cb(void*) {
 }
 
 void on_audio_connected(uint32_t rate, Codec codec, uint16_t handle) {
-    if (s_reopening.exchange(false)) esp_timer_stop(s_reopen_timer);
+    bool by_reopen = s_reopening.exchange(false);
+    if (by_reopen) esp_timer_stop(s_reopen_timer);
+    s_open_by_reopen.store(by_reopen);  // pcm_source_changed より前に（audio タスクがそれを見て読む）
     s_audio_req_ms.store(0);
     s_rate.store(rate);
     s_sync_handle = handle;
@@ -389,20 +400,20 @@ void hf_cb(esp_hf_cb_event_t event, esp_hf_cb_param_t* p) {
             if (st == ESP_HF_CONNECTION_STATE_CONNECTING) {
                 g_state.bt_state.store(BtState::Connecting);
             } else if (st == ESP_HF_CONNECTION_STATE_CONNECTED) {
-                event_log("RFCOMM 接続");
+                event_log("RFCOMM接続");
             } else if (st == ESP_HF_CONNECTION_STATE_SLC_CONNECTED) {
                 memcpy(s_peer, p->conn_stat.remote_bda, 6);
                 s_has_peer = true;
                 s_connecting_saved = false;
                 s_disc_requested.store(false);
                 if (s_reconnecting.load()) {
-                    event_log("つなぎ直しました（%d 回目）", s_reconnect_tries);
+                    event_log("再接続しました（%d 回目）", s_reconnect_tries);
                     stop_reconnect(nullptr);
                 }
                 g_state.bt_state.store(BtState::Connected);
                 // HF の機能フラグ 0x10 = 音量・マイク感度の遠隔設定に対応（BTA_AG_PEER_FEAT_VOL）
                 g_state.hf_remote_volume.store((p->conn_stat.peer_feat & 0x10) != 0);
-                event_log("SLC 接続 (HF feat 0x%lx)", (unsigned long)p->conn_stat.peer_feat);
+                event_log("SLC接続 (HF feat 0x%lx)", (unsigned long)p->conn_stat.peer_feat);
                 {
                     // 実際につながった機器を「最後に接続した機器」にする（B2 で向こうからつないできた場合も）
                     char name[40];
@@ -950,6 +961,8 @@ void audio_close() {
     esp_hf_ag_audio_disconnect(s_peer);
 }
 
+bool last_open_was_reopen() { return s_open_by_reopen.load(); }
+
 bool audio_reopen() {
     if (!s_audio_on.load() || !s_audio_wanted.load() || audio_busy() || s_reopening.load()) return false;
     s_reopening.store(true);
@@ -975,7 +988,7 @@ void set_loopback(bool on) {
     if (g_state.loopback.load() == on) return;
     s_loop_reset.store(true);
     g_state.loopback.store(on);
-    if (on) event_log("ループバック開始（%.1f 秒遅れ）", kLoopbackDelayMs / 1000.0);
+    if (on) event_log("ループバック開始");
     else event_log("ループバック終了");
 }
 

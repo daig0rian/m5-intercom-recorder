@@ -41,11 +41,6 @@ extern "C" void app_main() {
     storage::mount();
     storage::start_writer_task();
     rtc_clock::init();  // 時計を合わせたログも SD に残るよう、書き込み係を先に動かす
-    // 電池の残量の出し方は電源 IC で変わる（ui.cpp の read_power）ので、どちらだったかをログに残す
-    const auto pmic = M5.Power.getType();
-    event_log("電源 IC：%s", pmic == m5::Power_Class::pmic_axp192    ? "AXP192"
-                            : pmic == m5::Power_Class::pmic_axp2101 ? "AXP2101"
-                                                                     : "不明");
     audio_pipeline::start();
     log_heap("BT 前");
 

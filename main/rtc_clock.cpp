@@ -115,7 +115,7 @@ void init() {
     if (read_settime_file(&t)) {
         write_rtc(t);
         set_system_time(t);
-        event_log("時刻を設定 %04d-%02d-%02d %02d:%02d", t.tm_year + 1900, t.tm_mon + 1, t.tm_mday, t.tm_hour,
+        event_log("時刻設定 %04d-%02d-%02d %02d:%02d", t.tm_year + 1900, t.tm_mon + 1, t.tm_mday, t.tm_hour,
                   t.tm_min);
         return;
     }
@@ -139,7 +139,7 @@ void init() {
         ESP_LOGW(TAG, "RTC の時刻が無効なので、ビルド日時を使います");
         if (M5.Rtc.isEnabled()) write_rtc(t);
         set_system_time(t);
-        event_log("RTC未設定: メニューの「時刻合わせ」で合わせてください");
+        event_log("時刻未設定 メニュー > 時刻合わせ で設定してください");
     }
 }
 
