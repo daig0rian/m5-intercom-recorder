@@ -1,5 +1,7 @@
 # m5-intercom-recorder
 
+![B+COM の会話を録音している M5Stack Core2](docs/hero.jpg)
+
 バイク用インカム B+COM の会話を録音するレコーダーです。 
 B+COM以外のインカムやBluetoothヘッドセットにも使えます。
 
